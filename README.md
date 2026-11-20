@@ -23,7 +23,8 @@ python calibrate.py --cols 9 --rows 6 --square 0.025
 python live_depth.py --engine da2_metric_large.engine --calib calib.npz
 ```
 
-In the image window: `s` saves a `.ply` cloud and `.npy` depth, `q` quits.
+In the image window: `c` cycles the depth colour map (jet, rainbow, turbo, ...), `i` inverts it,
+`s` saves a `.ply` cloud and `.npy` depth, `q` quits. Pick the starting map with `--colormap jet`.
 Run any script with `--help` for all options.
 
 ## Notes

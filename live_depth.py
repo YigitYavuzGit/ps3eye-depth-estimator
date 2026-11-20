@@ -3,7 +3,8 @@
 
     python live_depth.py --engine da2_metric_large.engine --calib calib.npz
 
-Keys (in the image window): q / Esc quit, s save cloud (.ply) + depth (.npy).
+Keys (in the image window): q / Esc quit, s save cloud (.ply) + depth (.npy),
+c next colour map, i invert colour map.
 """
 import argparse
 import math
@@ -17,6 +18,15 @@ import torch.nn.functional as F
 
 MEAN = (0.485, 0.456, 0.406)
 STD = (0.229, 0.224, 0.225)
+
+# Depth colour maps, in the order the "c" key cycles through them.
+COLORMAPS = {
+    name: getattr(cv2, "COLORMAP_" + name.upper())
+    for name in ("inferno", "jet", "rainbow", "turbo", "viridis", "plasma", "magma", "hot",
+                 "cool", "hsv", "bone", "ocean", "parula", "cividis", "twilight")
+    if hasattr(cv2, "COLORMAP_" + name.upper())
+}
+COLORMAPS["gray"] = None  # plain greyscale
 
 
 class Camera:
@@ -125,6 +135,9 @@ def main():
     ap.add_argument("--max-depth", type=float, default=8.0, help="metres; also the top of the colour scale")
     ap.add_argument("--edge-thresh", type=float, default=0.05,
                     help="drop points where depth jumps by more than this fraction between pixels (0 = keep all)")
+    ap.add_argument("--colormap", choices=list(COLORMAPS), default="inferno", help="depth colour map (c cycles live)")
+    ap.add_argument("--invert", action="store_true",
+                    help="map far to the top of the colour map instead of near (i toggles live)")
     ap.add_argument("--stride", type=int, default=1, help="keep every Nth point per axis")
     ap.add_argument("--point-size", type=float, default=2.0)
     ap.add_argument("--no-cloud", action="store_true", help="depth image only (no Open3D window)")
@@ -163,6 +176,8 @@ def main():
         opt.background_color = np.array([0.05, 0.05, 0.07])
         pcd = o3d.geometry.PointCloud()
     cloud_added = False
+    cmap_names = list(COLORMAPS)
+    cmap_idx, invert = cmap_names.index(args.colormap), args.invert
 
     seq, fps, t_prev = 0, 0.0, time.perf_counter()
     try:
@@ -211,18 +226,25 @@ def main():
             fps = 0.9 * fps + 0.1 / max(now - t_prev, 1e-6) if fps else 1.0 / max(now - t_prev, 1e-6)
             t_prev = now
 
-            depth_vis = cv2.applyColorMap(255 - depth_u8, cv2.COLORMAP_INFERNO)
+            # Default: near = top of the colour map (bright / red), far = bottom.
+            scaled = depth_u8 if invert else 255 - depth_u8
+            cmap = COLORMAPS[cmap_names[cmap_idx]]
+            depth_vis = cv2.cvtColor(scaled, cv2.COLOR_GRAY2BGR) if cmap is None else cv2.applyColorMap(scaled, cmap)
             depth_vis = cv2.resize(depth_vis, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_LINEAR)
             centre = float(depth[mh // 2, mw // 2])
             view = np.hstack((frame, depth_vis))
             cv2.drawMarker(view, (frame.shape[1] // 2, frame.shape[0] // 2), (0, 255, 0), cv2.MARKER_CROSS, 14, 1)
-            cv2.putText(view, f"{fps:5.1f} FPS   centre {centre:.2f} m", (8, 22),
+            cv2.putText(view, f"{fps:5.1f} FPS   centre {centre:.2f} m   {cmap_names[cmap_idx]}", (8, 22),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
             cv2.imshow("PS3 Eye | depth", view)
 
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 break
+            if key == ord("c"):
+                cmap_idx = (cmap_idx + 1) % len(cmap_names)
+            elif key == ord("i"):
+                invert = not invert
             if key == ord("s"):
                 stamp = time.strftime("%Y%m%d_%H%M%S")
                 np.save(f"depth_{stamp}.npy", depth.cpu().numpy())
