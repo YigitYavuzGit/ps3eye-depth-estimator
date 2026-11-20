@@ -1,0 +1,7 @@
+torch
+tensorrt
+transformers
+onnx
+opencv-python
+open3d
+numpy

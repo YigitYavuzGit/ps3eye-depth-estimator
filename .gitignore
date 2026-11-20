@@ -1,0 +1,8 @@
+venv/
+__pycache__/
+*.onnx
+*.onnx.data
+*.engine
+calib.npz
+depth_*.npy
+cloud_*.ply
