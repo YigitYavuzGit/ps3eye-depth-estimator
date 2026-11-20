@@ -37,8 +37,12 @@ Everything is selectable with the mouse in the window's toolbar:
 Hover over a view to read the distance under the cursor in the status bar. The window can be
 resized, maximised or made fullscreen (**Fullscreen** button, `f`, or `--fullscreen`); views scale to fit.
 
+The **Layout** button (`l`, `--layout`) switches between `grid` (even grid), `stack` (views on top of
+each other) and `focus` (one big view using the full height, the rest in a column on the right).
+In focus, click a small view to make it the big one; double-clicking any view enlarges it.
+
 Keys: `1`-`6` toggle views, `c` next colour map, `i` invert, `a` auto range, `r` reset cloud view,
-`+`/`-` zoom, `[` `]` far limit, `;` `'` near limit, `f` fullscreen, `s` save, `q` quit. Starting state: `--views camera,depth,cloud --colormap jet`.
+`+`/`-` zoom, `[` `]` far limit, `;` `'` near limit, `l` layout, `f` fullscreen, `s` save, `q` quit. Starting state: `--views camera,depth,cloud --colormap jet`.
 
 The confidence view is an estimate, not a model output: Depth Anything V2 does not predict
 confidence, so it is derived from depth discontinuities and frame-to-frame stability.

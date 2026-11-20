@@ -10,9 +10,11 @@ handles of the range slider). In the point cloud view, drag to orbit and scroll 
 
 Keys: 1-6 toggle views, c next colour map, i invert, a auto range, r reset cloud
 view, +/- zoom cloud, [ ] move the far limit, ; ' move the near limit,
-f fullscreen, s save (.ply, .npy, .png), q / Esc quit (Esc leaves fullscreen first).
+l next layout, f fullscreen, s save (.ply, .npy, .png), q / Esc quit (Esc leaves fullscreen first).
 
 The window can be resized, maximised or made fullscreen; the views scale to fit.
+Layouts: grid, stack (vertical), focus (one big view; click a small view or
+double-click any view to enlarge it).
 """
 import argparse
 import math
@@ -34,6 +36,7 @@ _CMAP_NAMES = ("inferno", "jet", "rainbow", "turbo", "viridis", "plasma", "magma
 COLORMAPS = {n: getattr(cv2, "COLORMAP_" + n.upper()) for n in _CMAP_NAMES if hasattr(cv2, "COLORMAP_" + n.upper())}
 COLORMAPS["gray"] = None
 
+LAYOUTS = ("grid", "stack", "focus")
 PANES = ("camera", "depth", "intensity", "confidence", "normals", "cloud")
 PANE_LABELS = {"camera": "Camera", "depth": "Depth", "intensity": "Intensity",
                "confidence": "Confidence", "normals": "Normals", "cloud": "Point cloud"}
@@ -147,7 +150,6 @@ def load_intrinsics(args, cam_w, cam_h):
 class Gui:
     """Toolbar, view layout and mouse state for the single OpenCV window."""
 
-    MIN_WIDTH = 1130   # the top button row needs this much
     MIN_CONTENT = 240
     ROW = 30
     STATUS = 24
@@ -155,6 +157,8 @@ class Gui:
     def __init__(self, args):
         self.width = 1280
         self.fullscreen = args.fullscreen
+        self.layout_mode = args.layout
+        self.main = None  # the big view in the focus layout
         self.panes = {p: p in args.views for p in PANES}
         self.cmap = args.colormap
         self.invert = args.invert
@@ -172,6 +176,7 @@ class Gui:
         self.cells = {}
         self.luts = {name: colormap_lut(name) for name in COLORMAPS}
         self._build_buttons()
+        self.min_width = self.row1_end + 6  # the top button row needs this much
 
     # ---- toolbar -------------------------------------------------------------
     def _build_buttons(self):
@@ -190,9 +195,11 @@ class Gui:
         add("toggle", "auto_range", "Auto range")
         add("toggle", "cloud_depth_colour", "Cloud colour: depth", gap=18)
         add("action", "reset", "Reset view")
-        add("action", "save", "Save")
+        add("action", "save", "Save", gap=18)
+        add("cycle", "layout", "Layout: focus")
         add("toggle", "fullscreen", "Fullscreen")
         add("action", "quit", "Quit")
+        self.row1_end = x
 
         names = list(COLORMAPS)
         per_row = math.ceil(len(names) / 2)
@@ -260,6 +267,8 @@ class Gui:
                 if value == self.cmap:
                     cv2.rectangle(bar, (x0 - 1, y0 - 1), (x1, y1), (255, 255, 255), 2)
                 continue
+            if kind == "cycle":
+                text = f"Layout: {self.layout_mode}"
             on = self._active(kind, value)
             cv2.rectangle(bar, (x0, y0), (x1, y1), ACCENT if on else (62, 62, 62), -1)
             cv2.rectangle(bar, (x0, y0), (x1, y1), (110, 110, 110), 1)
@@ -274,6 +283,8 @@ class Gui:
             setattr(self, value, not getattr(self, value))
         elif kind == "cmap":
             self.cmap = value
+        elif kind == "cycle":
+            self.next_layout()
         elif value == "reset":
             self.reset_view()
         else:
@@ -297,26 +308,46 @@ class Gui:
 
     # ---- layout and mouse ----------------------------------------------------
     def layout(self, content_h, aspect):
-        """Tiles the enabled views in an even grid below the toolbar (1, 2, 2x2, 3x2: a new
-        row starts rather than squeezing more into one), each as large as fits at the
-        camera's aspect ratio. Returns {pane: (x, y, w, h)} in canvas pixels."""
+        """Places the enabled views below the toolbar, each as large as fits at the camera's
+        aspect ratio. Returns {pane: (x, y, w, h)} in canvas pixels.
+
+        grid:  even grid (1, 2, 2x2, 3x2), starting a new row rather than squeezing a row
+        stack: one column, views on top of each other
+        focus: one big view using the full height, the others as a column on the right
+        """
         active = [p for p in PANES if self.panes[p]]
         n = len(active)
-        cols = math.ceil(math.sqrt(n))
-        rows = math.ceil(n / cols)
-        w = min(self.width / cols, content_h / rows * aspect)
-        cw, ch = int(w), int(w / aspect)
-        slot_w, slot_h = self.width / cols, content_h / rows
+        width, top = self.width, self.toolbar_h
+
+        def fit(x, y, w, h):  # largest aspect-correct rectangle centred in a slot
+            cw = min(w, h * aspect)
+            ch = cw / aspect
+            return int(x + (w - cw) / 2), int(y + (h - ch) / 2), int(cw), int(ch)
+
         cells = {}
-        for i, p in enumerate(active):
-            r, c = divmod(i, cols)
-            in_row = min(cols, n - r * cols)          # centre a short last row
-            x_off = (self.width - in_row * slot_w) / 2
-            x = int(x_off + c * slot_w + (slot_w - cw) / 2)
-            y = int(self.toolbar_h + r * slot_h + (slot_h - ch) / 2)
-            cells[p] = (x, y, cw, ch)
+        if self.layout_mode == "focus" and n > 1:
+            if self.main not in active:
+                self.main = active[0]
+            others = [p for p in active if p != self.main]
+            slot_h = content_h / len(others)
+            side_w = min(slot_h * aspect, width * 0.3)
+            cells[self.main] = fit(0, top, width - side_w, content_h)
+            for i, p in enumerate(others):
+                cells[p] = fit(width - side_w, top + i * slot_h, side_w, slot_h)
+        else:
+            cols = 1 if self.layout_mode == "stack" else math.ceil(math.sqrt(n))
+            rows = math.ceil(n / cols)
+            slot_w, slot_h = width / cols, content_h / rows
+            for i, p in enumerate(active):
+                r, c = divmod(i, cols)
+                in_row = min(cols, n - r * cols)          # centre a short last row
+                x_off = (width - in_row * slot_w) / 2
+                cells[p] = fit(x_off + c * slot_w, top + r * slot_h, slot_w, slot_h)
         self.cells = cells
         return cells
+
+    def next_layout(self):
+        self.layout_mode = LAYOUTS[(LAYOUTS.index(self.layout_mode) + 1) % len(LAYOUTS)]
 
     def pane_at(self, x, y):
         for p, (cx, cy, cw, ch) in self.cells.items():
@@ -338,8 +369,16 @@ class Gui:
                     if x0 <= x <= x1 and y0 <= y <= y1:
                         self._click(kind, value)
                         break
+            elif self.layout_mode == "focus" and pane and pane != self.main:
+                self.main = pane  # clicking a small view makes it the big one
             elif pane == "cloud":
                 self.drag = (x, y)
+        elif event == cv2.EVENT_LBUTTONDBLCLK and pane:
+            # Double-click a view to enlarge it; double-click the big view to go back to the grid.
+            if self.layout_mode == "focus" and pane == self.main:
+                self.layout_mode = "grid"
+            else:
+                self.layout_mode, self.main = "focus", pane
         elif event == cv2.EVENT_MOUSEMOVE and self.slider_drag and flags & cv2.EVENT_FLAG_LBUTTON:
             self._slider_move(x)
         elif event == cv2.EVENT_MOUSEMOVE and self.drag and flags & cv2.EVENT_FLAG_LBUTTON:
@@ -437,7 +476,9 @@ def run(args, cam, model, dev):
     window = "PS3 Eye depth"
     # Resizable window without OpenCV's own toolbar. The canvas is redrawn at the window's
     # size every frame, so it is shown 1:1 and mouse coordinates need no scaling.
-    cv2.namedWindow(window, cv2.WINDOW_NORMAL | getattr(cv2, "WINDOW_GUI_NORMAL", 0))
+    # FREERATIO matters: with the default keep-ratio mode the image is letterboxed inside the
+    # window and the reported image size never grows to the window's real size.
+    cv2.namedWindow(window, cv2.WINDOW_NORMAL | cv2.WINDOW_FREERATIO | getattr(cv2, "WINDOW_GUI_NORMAL", 0))
     cv2.resizeWindow(window, 1280, 900)
     aspect = cam.width / cam.height
     fullscreen_applied = False
@@ -511,7 +552,7 @@ def run(args, cam, model, dev):
             win_w = win_h = 0
         if win_w <= 0 or win_h <= 0:  # window not mapped yet, or backend cannot tell
             win_w, win_h = 1280, 900
-        gui.resize(max(win_w, gui.MIN_WIDTH))
+        gui.resize(max(win_w, gui.min_width))
         canvas_h = max(win_h, gui.toolbar_h + gui.MIN_CONTENT + gui.STATUS)
         cells = gui.layout(canvas_h - gui.toolbar_h - gui.STATUS, aspect)
         canvas = np.zeros((canvas_h, gui.width, 3), np.uint8)
@@ -607,6 +648,8 @@ def run(args, cam, model, dev):
             gui.toggle_pane(PANES[key - ord("1")])
         elif key == ord("c"):
             gui.next_cmap()
+        elif key == ord("l"):
+            gui.next_layout()
         elif key == ord("i"):
             gui.invert = not gui.invert
         elif key == ord("a"):
@@ -655,6 +698,8 @@ def parse_args(argv=None):
     ap.add_argument("--colormap", choices=list(COLORMAPS), default="inferno", help="starting colour map")
     ap.add_argument("--invert", action="store_true", help="map far to the top of the colour map instead of near")
     ap.add_argument("--auto-range", action="store_true", help="stretch the colour scale to the scene's depth range")
+    ap.add_argument("--layout", choices=LAYOUTS, default="grid",
+                    help="how views are arranged: even grid, stacked vertically, or one big view (l cycles)")
     ap.add_argument("--fullscreen", action="store_true", help="start in fullscreen (f or the toolbar button toggles)")
     ap.add_argument("--open3d", action="store_true", help="also open a separate Open3D point cloud window")
     args = ap.parse_args(argv)
