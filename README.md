@@ -28,13 +28,16 @@ Everything is selectable with the mouse in the window's toolbar:
 - **Views** (any combination, tiled): camera, depth, intensity, confidence, surface normals,
   and a point cloud preview. In the point cloud view, drag to orbit and scroll to zoom.
 - **Colour map**: click a swatch (inferno, jet, rainbow, turbo, viridis, ... and grey).
-- **Invert**, **Auto range** (stretch colours to the scene instead of 0 to `--max-depth`),
+- **Range slider**: drag the near and far handles to set the depth range. Colours span it, and
+  everything outside is greyed out in the depth view and removed from the point cloud.
+  Starting values: `--min-depth`, `--max-depth`; slider length: `--range-limit` (10 m).
+- **Invert**, **Auto range** (stretch colours to what is actually inside the range),
   **Cloud colour: depth**, **Reset view**, **Save** (`.ply` cloud, `.npy` depth, `.png` view).
 
 Hover over a view to read the distance under the cursor in the status bar.
 
 Keys: `1`-`6` toggle views, `c` next colour map, `i` invert, `a` auto range, `r` reset cloud view,
-`+`/`-` zoom, `s` save, `q` quit. Starting state: `--views camera,depth,cloud --colormap jet`.
+`+`/`-` zoom, `[` `]` far limit, `;` `'` near limit, `s` save, `q` quit. Starting state: `--views camera,depth,cloud --colormap jet`.
 
 The confidence view is an estimate, not a model output: Depth Anything V2 does not predict
 confidence, so it is derived from depth discontinuities and frame-to-frame stability.

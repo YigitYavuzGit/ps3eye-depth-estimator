@@ -5,11 +5,12 @@
 
 Everything is selectable with the mouse in the window's toolbar: which views are
 shown (camera, depth, intensity, confidence, normals, point cloud), the colour map,
-invert, auto range and the point cloud colouring. In the point cloud view, drag to
-orbit and scroll to zoom.
+invert, auto range, the point cloud colouring, and the depth range (drag the two
+handles of the range slider). In the point cloud view, drag to orbit and scroll to zoom.
 
 Keys: 1-6 toggle views, c next colour map, i invert, a auto range, r reset cloud
-view, +/- zoom cloud, s save (.ply, .npy, .png), q / Esc quit.
+view, +/- zoom cloud, [ ] move the far limit, ; ' move the near limit,
+s save (.ply, .npy, .png), q / Esc quit.
 """
 import argparse
 import math
@@ -158,6 +159,10 @@ class Gui:
         self.zoom = 1.0
         self.mouse = (-1, -1)
         self.drag = None
+        # Depth range in metres: colours span it and everything outside is clipped.
+        self.limit = max(args.range_limit, args.max_depth)
+        self.near, self.far = args.min_depth, args.max_depth
+        self.slider_drag = None
         self.pending = []  # one-shot actions for the main loop: "save", "quit"
         self.cells = {}
         self.luts = {name: colormap_lut(name) for name in COLORMAPS}
@@ -190,7 +195,41 @@ class Gui:
             r, c = divmod(i, per_row)
             x0, y0 = 6 + c * bw, self.ROW * (1 + r) + 2
             self.buttons.append((x0, y0, x0 + bw - 3, y0 + self.ROW - 4, "cmap", name, name))
-        self.toolbar_h = self.ROW * 3 + 4
+        self.slider_y0 = self.ROW * 3 + 4
+        self.slider_x0, self.slider_x1 = 70, self.WIDTH - 200
+        self.toolbar_h = self.ROW * 4 + 6
+
+    # ---- range slider --------------------------------------------------------
+    def _slider_x(self, metres):
+        return int(round(self.slider_x0 + (self.slider_x1 - self.slider_x0) * metres / self.limit))
+
+    def set_range(self, near=None, far=None):
+        gap = 0.05
+        if near is not None:
+            self.near = round(min(max(near, 0.0), self.far - gap), 2)
+        if far is not None:
+            self.far = round(min(max(far, self.near + gap), self.limit), 2)
+
+    def _slider_move(self, x):
+        metres = (x - self.slider_x0) / (self.slider_x1 - self.slider_x0) * self.limit
+        self.set_range(**{self.slider_drag: metres})
+
+    def _draw_slider(self, bar):
+        y0, y1 = self.slider_y0 + 7, self.slider_y0 + self.ROW - 7
+        xn, xf = self._slider_x(self.near), self._slider_x(self.far)
+        cv2.putText(bar, "Range", (10, y1 - 3), FONT, 0.45, (205, 205, 205), 1, cv2.LINE_AA)
+        cv2.rectangle(bar, (self.slider_x0, y0), (self.slider_x1, y1), (62, 62, 62), -1)
+        if xf > xn:  # the selected span, painted with the colours it maps to
+            ramp = np.linspace(0, 255, xf - xn).astype(np.int64)
+            bar[y0:y1 + 1, xn:xf] = self.luts[self.cmap][ramp if self.invert else 255 - ramp][None]
+        for metre in range(int(self.limit) + 1):
+            x = self._slider_x(metre)
+            cv2.line(bar, (x, y1 + 1), (x, y1 + 4), (150, 150, 150), 1)
+        for x in (xn, xf):
+            cv2.rectangle(bar, (x - 4, y0 - 4), (x + 4, y1 + 4), (255, 255, 255), -1)
+            cv2.rectangle(bar, (x - 4, y0 - 4), (x + 4, y1 + 4), (40, 40, 40), 1)
+        cv2.putText(bar, f"{self.near:.2f} - {self.far:.2f} m", (self.slider_x1 + 18, y1 - 3),
+                    FONT, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
     def _active(self, kind, value):
         if kind == "pane":
@@ -214,6 +253,7 @@ class Gui:
             cv2.rectangle(bar, (x0, y0), (x1, y1), ACCENT if on else (62, 62, 62), -1)
             cv2.rectangle(bar, (x0, y0), (x1, y1), (110, 110, 110), 1)
             cv2.putText(bar, text, (x0 + 9, y1 - 8), FONT, 0.45, (255, 255, 255) if on else (205, 205, 205), 1, cv2.LINE_AA)
+        self._draw_slider(bar)
         return bar
 
     def _click(self, kind, value):
@@ -269,19 +309,26 @@ class Gui:
         self.mouse = (x, y)
         pane = self.pane_at(x, y)[0]
         if event == cv2.EVENT_LBUTTONDOWN:
-            if y < self.toolbar_h:
+            if self.slider_y0 <= y < self.toolbar_h:
+                # Grab whichever handle is closer to the click.
+                dn, df = abs(x - self._slider_x(self.near)), abs(x - self._slider_x(self.far))
+                self.slider_drag = "near" if dn < df or (dn == df and x < self._slider_x(self.near)) else "far"
+                self._slider_move(x)
+            elif y < self.toolbar_h:
                 for x0, y0, x1, y1, kind, value, _ in self.buttons:
                     if x0 <= x <= x1 and y0 <= y <= y1:
                         self._click(kind, value)
                         break
             elif pane == "cloud":
                 self.drag = (x, y)
+        elif event == cv2.EVENT_MOUSEMOVE and self.slider_drag and flags & cv2.EVENT_FLAG_LBUTTON:
+            self._slider_move(x)
         elif event == cv2.EVENT_MOUSEMOVE and self.drag and flags & cv2.EVENT_FLAG_LBUTTON:
             self.yaw -= (x - self.drag[0]) * 0.008
             self.pitch = min(max(self.pitch + (y - self.drag[1]) * 0.008, -1.45), 1.45)
             self.drag = (x, y)
         elif event == cv2.EVENT_LBUTTONUP:
-            self.drag = None
+            self.drag = self.slider_drag = None
         elif event == cv2.EVENT_MOUSEWHEEL and pane == "cloud":
             self.zoom_by(0.88 if cv2.getMouseWheelDelta(flags) > 0 else 1 / 0.88)
 
@@ -383,7 +430,7 @@ def run(args, cam, model, dev):
     cloud_added = False
 
     ema = None                      # temporal average of depth, for the confidence estimate
-    lo, hi = 0.0, args.max_depth    # displayed depth range
+    lo, hi = gui.near, gui.far      # depth range the colours span
     pivot_z = 2.0                   # orbit centre of the cloud preview
     seq, fps, t_prev = 0, 0.0, time.perf_counter()
     shown = False
@@ -408,7 +455,7 @@ def run(args, cam, model, dev):
             ema = depth.clone()
         rel_time = (depth - ema).abs() / safe
         ema = torch.lerp(ema, depth, 0.3)
-        in_range = (depth > args.min_depth) & (depth < args.max_depth)
+        in_range = (depth > gui.near) & (depth < gui.far)
         conf = torch.exp(-(rel_edge / 0.08) ** 2) * torch.exp(-(rel_time / 0.05) ** 2) * in_range
 
         valid = in_range & (conf >= args.min_conf)
@@ -416,12 +463,14 @@ def run(args, cam, model, dev):
             valid &= rel_edge < args.edge_thresh
         pts = rays * depth.unsqueeze(-1)
 
-        # Displayed depth range: fixed, or the 2nd-98th percentile of the scene (smoothed).
-        if gui.auto_range:
-            q = torch.quantile(depth[::4, ::4].flatten(), torch.tensor([0.02, 0.98], device=dev))
+        # Colours span the selected range, or (auto) the 2nd-98th percentile of what is
+        # inside it, smoothed over time.
+        sample = depth[::4, ::4][in_range[::4, ::4]]
+        if gui.auto_range and sample.numel() > 16:
+            q = torch.quantile(sample, torch.tensor([0.02, 0.98], device=dev))
             lo, hi = 0.8 * lo + 0.2 * float(q[0]), 0.8 * hi + 0.2 * float(q[1])
         else:
-            lo, hi = 0.0, args.max_depth
+            lo, hi = gui.near, gui.far
         level = ((depth - lo) / max(hi - lo, 1e-3)).clamp(0, 1).mul(255).long()
         if not gui.invert:
             level = 255 - level  # near = top of the colour map
@@ -438,7 +487,10 @@ def run(args, cam, model, dev):
         pu, pv = min(int(px * mw), mw - 1), min(int(py * mh), mh - 1)
         probe_depth, probe_conf = float(depth[pv, pu]), float(conf[pv, pu])
 
-        depth_bgr = lut[level] if ("depth" in cells or gui.cloud_depth_colour) else None
+        depth_bgr = None
+        if "depth" in cells or gui.cloud_depth_colour:
+            depth_bgr = lut[level]
+            depth_bgr[~in_range] = 45  # outside the selected range: flat grey
         keep = valid & stride_mask
         bgr_small = (rgb[0].permute(1, 2, 0).flip(-1) * 255).byte()
         if int(keep.sum()):
@@ -474,15 +526,15 @@ def run(args, cam, model, dev):
                     ramp = 255 - ramp
                 tile[40:ch - 20, cw - 22:cw - 10] = gui.luts[gui.cmap][ramp][:, None, :]
                 unit = " m" if pane == "depth" else ""
-                label(tile, f"{top:.1f}{unit}", (cw - 62, 34), 0.42)
-                label(tile, f"{bottom:.1f}{unit}", (cw - 62, ch - 6), 0.42)
+                label(tile, f"{top:.2f}{unit}", (cw - 70, 34), 0.42)
+                label(tile, f"{bottom:.2f}{unit}", (cw - 70, ch - 6), 0.42)
 
         now = time.perf_counter()
         inst = 1.0 / max(now - t_prev, 1e-6)
         fps, t_prev = (0.9 * fps + 0.1 * inst if fps else inst), now
         where = "centre" if probe_pane in (None, "cloud") else "cursor"
         status = (f"{fps:5.1f} FPS    {where}: {probe_depth:.2f} m, confidence {probe_conf:.2f}"
-                  f"    range {lo:.1f}-{hi:.1f} m    {int(keep.sum()):,} points")
+                  f"    colours {lo:.2f}-{hi:.2f} m    {int(keep.sum()):,} points")
         cv2.putText(canvas, status, (8, canvas.shape[0] - 7), FONT, 0.48, (210, 210, 210), 1, cv2.LINE_AA)
         cv2.imshow(window, canvas)
         shown = True
@@ -522,6 +574,10 @@ def run(args, cam, model, dev):
             gui.zoom_by(0.88)
         elif key == ord("-"):
             gui.zoom_by(1 / 0.88)
+        elif key in (ord("["), ord("]")):
+            gui.set_range(far=gui.far + (0.25 if key == ord("]") else -0.25))
+        elif key in (ord(";"), ord("'")):
+            gui.set_range(near=gui.near + (0.05 if key == ord("'") else -0.05))
         if key == ord("s") or "save" in gui.pending:
             stamp = time.strftime("%Y%m%d_%H%M%S")
             np.save(f"depth_{stamp}.npy", depth.cpu().numpy())
@@ -544,8 +600,9 @@ def parse_args(argv=None):
     ap.add_argument("--calib", default=None, help="calib.npz from calibrate.py")
     ap.add_argument("--hfov", type=float, default=60.0, help="horizontal FOV in degrees, used only without --calib")
     ap.add_argument("--depth-scale", type=float, default=1.0, help="multiply depth to correct metric scale")
-    ap.add_argument("--min-depth", type=float, default=0.15)
-    ap.add_argument("--max-depth", type=float, default=8.0, help="metres; also the top of the fixed colour scale")
+    ap.add_argument("--min-depth", type=float, default=0.15, help="starting near limit of the range, metres")
+    ap.add_argument("--max-depth", type=float, default=8.0, help="starting far limit of the range, metres")
+    ap.add_argument("--range-limit", type=float, default=10.0, help="right end of the range slider, metres")
     ap.add_argument("--edge-thresh", type=float, default=0.05,
                     help="drop points where depth jumps by more than this fraction between pixels (0 = keep all)")
     ap.add_argument("--min-conf", type=float, default=0.0, help="drop points below this estimated confidence (0-1)")
