@@ -297,17 +297,14 @@ class Gui:
 
     # ---- layout and mouse ----------------------------------------------------
     def layout(self, content_h, aspect):
-        """Tiles the enabled views into the area below the toolbar, as large as they fit
-        at the camera's aspect ratio. Returns {pane: (x, y, w, h)} in canvas pixels."""
+        """Tiles the enabled views in an even grid below the toolbar (1, 2, 2x2, 3x2: a new
+        row starts rather than squeezing more into one), each as large as fits at the
+        camera's aspect ratio. Returns {pane: (x, y, w, h)} in canvas pixels."""
         active = [p for p in PANES if self.panes[p]]
         n = len(active)
-        best = None
-        for cols in range(1, n + 1):
-            rows = math.ceil(n / cols)
-            w = min(self.width / cols, content_h / rows * aspect)
-            if best is None or w > best[0]:
-                best = (w, cols, rows)
-        w, cols, rows = best
+        cols = math.ceil(math.sqrt(n))
+        rows = math.ceil(n / cols)
+        w = min(self.width / cols, content_h / rows * aspect)
         cw, ch = int(w), int(w / aspect)
         slot_w, slot_h = self.width / cols, content_h / rows
         cells = {}
@@ -441,7 +438,7 @@ def run(args, cam, model, dev):
     # Resizable window without OpenCV's own toolbar. The canvas is redrawn at the window's
     # size every frame, so it is shown 1:1 and mouse coordinates need no scaling.
     cv2.namedWindow(window, cv2.WINDOW_NORMAL | getattr(cv2, "WINDOW_GUI_NORMAL", 0))
-    cv2.resizeWindow(window, 1280, 800)
+    cv2.resizeWindow(window, 1280, 900)
     aspect = cam.width / cam.height
     fullscreen_applied = False
     cv2.setMouseCallback(window, gui.on_mouse)
@@ -513,7 +510,7 @@ def run(args, cam, model, dev):
         except cv2.error:
             win_w = win_h = 0
         if win_w <= 0 or win_h <= 0:  # window not mapped yet, or backend cannot tell
-            win_w, win_h = 1280, 800
+            win_w, win_h = 1280, 900
         gui.resize(max(win_w, gui.MIN_WIDTH))
         canvas_h = max(win_h, gui.toolbar_h + gui.MIN_CONTENT + gui.STATUS)
         cells = gui.layout(canvas_h - gui.toolbar_h - gui.STATUS, aspect)
