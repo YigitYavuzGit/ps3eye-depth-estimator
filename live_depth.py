@@ -25,6 +25,7 @@ double-click any view to enlarge it).
 import argparse
 import math
 import os
+import sys
 import threading
 import time
 
@@ -33,6 +34,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+import frame_server
 import pose_protocol
 
 MEAN = (0.485, 0.456, 0.406)
@@ -62,11 +64,20 @@ def colormap_lut(name):
     return lut.reshape(256, 3)
 
 
+def camera_backend():
+    """V4L2 on Linux; DirectShow on Windows (the PS3 Eye needs a DirectShow driver there)."""
+    if sys.platform.startswith("linux"):
+        return cv2.CAP_V4L2
+    if sys.platform == "win32":
+        return cv2.CAP_DSHOW
+    return cv2.CAP_ANY
+
+
 class Camera:
     """Grabs frames on a thread so the pipeline always gets the newest one."""
 
     def __init__(self, device, width, height, fps):
-        self.cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
+        self.cap = cv2.VideoCapture(device, camera_backend())
         if not self.cap.isOpened():
             raise SystemExit(f"Cannot open camera {device}")
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
@@ -641,6 +652,15 @@ def run(args, cam, model, dev):
     std = torch.tensor(STD, device=dev).view(1, 3, 1, 1)
     y_up = torch.tensor([1.0, -1.0, -1.0], device=dev)  # export convention: +Y up, camera looks down -Z
 
+    # Frame stream for other programs (e.g. a DIAVision plug-in), on the camera's pixel grid.
+    server = None
+    if args.serve:
+        server = frame_server.FrameServer(args.serve_host, args.serve_port)
+        print(f"Streaming frames on {server.address[0]}:{server.address[1]}")
+        vv, uu = torch.meshgrid(torch.arange(cam.height, device=dev), torch.arange(cam.width, device=dev), indexing="ij")
+        rays_cam = torch.stack(((uu + 0.5 - K[0, 2]) / K[0, 0], (vv + 0.5 - K[1, 2]) / K[1, 1],
+                                torch.ones(cam.height, cam.width, device=dev)), dim=-1).float()
+
     gui = Gui(args)
     luts = {name: torch.from_numpy(lut).to(dev) for name, lut in gui.luts.items()}
     win = Window("PS3 Eye depth", gui)
@@ -740,6 +760,15 @@ def run(args, cam, model, dev):
             depth_bgr = lut[level]
             depth_bgr[~in_range] = 45  # outside the selected range: flat grey
         keep = valid & stride_mask
+
+        if server is not None and server.clients:
+            # Depth in millimetres with unreliable pixels zeroed, upsampled to the camera grid.
+            depth_mm = F.interpolate((torch.where(valid, depth, torch.zeros_like(depth)) * 1000.0)[None, None],
+                                     size=(cam.height, cam.width), mode="nearest")[0, 0].clamp(0, 65535)
+            server.publish(seq, (K[0, 0], K[1, 1], K[0, 2], K[1, 2]),
+                           cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), frame,
+                           depth_mm.round().to(torch.int32).cpu().numpy(),
+                           (rays_cam * depth_mm.unsqueeze(-1)).cpu().numpy())
         bgr_small = (rgb[0].permute(1, 2, 0).flip(-1) * 255).byte()
 
         # 6D pose: FoundationPose gets the model-resolution image, the depth with unreliable
@@ -891,6 +920,8 @@ def run(args, cam, model, dev):
         gui.pending.clear()
 
     win.close()
+    if server is not None:
+        server.close()
     if tracker is not None:
         tracker.close()
     if vis is not None:
@@ -924,6 +955,10 @@ def parse_args(argv=None):
     ap.add_argument("--layout", choices=LAYOUTS, default="grid",
                     help="how views are arranged: even grid, stacked vertically, or one big view (l cycles)")
     ap.add_argument("--fullscreen", action="store_true", help="start in fullscreen (f or the toolbar button toggles)")
+    ap.add_argument("--serve", action="store_true",
+                    help="stream image, depth and point cloud to other programs (see frame_server.py)")
+    ap.add_argument("--serve-host", default="127.0.0.1", help="interface to stream on (default: this machine only)")
+    ap.add_argument("--serve-port", type=int, default=frame_server.DEFAULT_PORT)
     ap.add_argument("--pose", action="store_true",
                     help="6D object pose with FoundationPose: connect to fp_server.py and show the Select object button")
     ap.add_argument("--pose-host", default="127.0.0.1", help="where fp_server.py runs")

@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Build on the DIAVision PC:  dotnet build -c Release
+       If DIAVision is installed elsewhere:  dotnet build -c Release -p:DIAVisionDir="D:\...\DMV-IVS" -->
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <AssemblyName>PS3EyeDepth</AssemblyName>
+    <RootNamespace>PS3EyeDepth</RootNamespace>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <DIAVisionDir Condition="'$(DIAVisionDir)' == ''">C:\Program Files\Delta Industrial Automation\DIAVision\DMV-IVS</DIAVisionDir>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="DepthStreamClient.cs" />
+    <Compile Include="PS3EyeDepthSource.cs" />
+    <Reference Include="DIAVision.Core">
+      <HintPath>$(DIAVisionDir)\DIAVision.Core.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+</Project>

@@ -8,6 +8,7 @@ SPACE captures a view when the board is detected, c calibrates and saves, q quit
 Take 15-25 views: different distances, tilts, and all corners of the image.
 """
 import argparse
+import sys
 
 import cv2
 import numpy as np
@@ -24,7 +25,7 @@ def main():
     ap.add_argument("--out", default="calib.npz")
     args = ap.parse_args()
 
-    cap = cv2.VideoCapture(args.device, cv2.CAP_V4L2)
+    cap = cv2.VideoCapture(args.device, cv2.CAP_V4L2 if sys.platform.startswith("linux") else cv2.CAP_ANY)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
     if not cap.isOpened():

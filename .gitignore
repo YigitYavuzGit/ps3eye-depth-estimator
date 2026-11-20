@@ -7,4 +7,6 @@ calib.npz
 depth_*.npy
 cloud_*.ply
 view_*.png
-diavision_*/
+diavision_2*/
+bin/
+obj/

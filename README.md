@@ -120,6 +120,17 @@ loads (Manage > Platform Settings > VirtualCamera): `image.png` (8-bit), `depth_
 depth map, millimetres, 0 = no data) and `cloud_mm.pcd` (points in millimetres, x right, y down,
 z forward from the lens). This is a file hand-off for testing, not a live connection.
 
+## Live stream for other programs
+
+`python live_depth.py --serve` streams each frame on a local TCP port (5600): grey image, colour
+image, 16-bit depth in millimetres and a per-pixel XYZ point cloud in millimetres, all on the
+camera's 640x480 grid. The format is documented at the top of `frame_server.py`.
+`python stream_client.py` is a reference client that prints what arrives. The stream is meant
+for the DIAVision plug-in in `diavision_plugin/` (see its README), which is still in progress.
+
+The viewer also opens the camera through DirectShow on Windows, so it can run next to DIAVision;
+the PS3 Eye needs a DirectShow driver there, and TensorRT engines have to be rebuilt on Windows.
+
 ## Notes
 
 - The viewer window uses pygame (SDL), not OpenCV's own window, whose Qt backend zooms the whole
