@@ -10,7 +10,9 @@ handles of the range slider). In the point cloud view, drag to orbit and scroll 
 
 Keys: 1-6 toggle views, c next colour map, i invert, a auto range, r reset cloud
 view, +/- zoom cloud, [ ] move the far limit, ; ' move the near limit,
-s save (.ply, .npy, .png), q / Esc quit.
+f fullscreen, s save (.ply, .npy, .png), q / Esc quit (Esc leaves fullscreen first).
+
+The window can be resized, maximised or made fullscreen; the views scale to fit.
 """
 import argparse
 import math
@@ -145,11 +147,14 @@ def load_intrinsics(args, cam_w, cam_h):
 class Gui:
     """Toolbar, view layout and mouse state for the single OpenCV window."""
 
-    WIDTH = 1280
+    MIN_WIDTH = 1130   # the top button row needs this much
+    MIN_CONTENT = 240
     ROW = 30
     STATUS = 24
 
     def __init__(self, args):
+        self.width = 1280
+        self.fullscreen = args.fullscreen
         self.panes = {p: p in args.views for p in PANES}
         self.cmap = args.colormap
         self.invert = args.invert
@@ -186,17 +191,18 @@ class Gui:
         add("toggle", "cloud_depth_colour", "Cloud colour: depth", gap=18)
         add("action", "reset", "Reset view")
         add("action", "save", "Save")
+        add("toggle", "fullscreen", "Fullscreen")
         add("action", "quit", "Quit")
 
         names = list(COLORMAPS)
         per_row = math.ceil(len(names) / 2)
-        bw = (self.WIDTH - 12) // per_row
+        bw = (self.width - 12) // per_row
         for i, name in enumerate(names):
             r, c = divmod(i, per_row)
             x0, y0 = 6 + c * bw, self.ROW * (1 + r) + 2
             self.buttons.append((x0, y0, x0 + bw - 3, y0 + self.ROW - 4, "cmap", name, name))
         self.slider_y0 = self.ROW * 3 + 4
-        self.slider_x0, self.slider_x1 = 70, self.WIDTH - 200
+        self.slider_x0, self.slider_x1 = 70, self.width - 200
         self.toolbar_h = self.ROW * 4 + 6
 
     # ---- range slider --------------------------------------------------------
@@ -231,6 +237,11 @@ class Gui:
         cv2.putText(bar, f"{self.near:.2f} - {self.far:.2f} m", (self.slider_x1 + 18, y1 - 3),
                     FONT, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
+    def resize(self, width):
+        if width != self.width:
+            self.width = width
+            self._build_buttons()
+
     def _active(self, kind, value):
         if kind == "pane":
             return self.panes[value]
@@ -239,7 +250,7 @@ class Gui:
         return False
 
     def draw_toolbar(self):
-        bar = np.full((self.toolbar_h, self.WIDTH, 3), 30, np.uint8)
+        bar = np.full((self.toolbar_h, self.width, 3), 30, np.uint8)
         for x0, y0, x1, y1, kind, value, text in self.buttons:
             if kind == "cmap":
                 swatch = self.luts[value].reshape(1, 256, 3)
@@ -285,19 +296,30 @@ class Gui:
         self.zoom = min(max(self.zoom * factor, 0.15), 4.0)
 
     # ---- layout and mouse ----------------------------------------------------
-    def layout(self):
-        """Tiles the enabled views; returns ({pane: (x, y, w, h)}, content height)."""
+    def layout(self, content_h, aspect):
+        """Tiles the enabled views into the area below the toolbar, as large as they fit
+        at the camera's aspect ratio. Returns {pane: (x, y, w, h)} in canvas pixels."""
         active = [p for p in PANES if self.panes[p]]
-        cols = 2 if len(active) <= 2 else 3
-        cw = self.WIDTH // cols
-        ch = cw * 3 // 4
+        n = len(active)
+        best = None
+        for cols in range(1, n + 1):
+            rows = math.ceil(n / cols)
+            w = min(self.width / cols, content_h / rows * aspect)
+            if best is None or w > best[0]:
+                best = (w, cols, rows)
+        w, cols, rows = best
+        cw, ch = int(w), int(w / aspect)
+        slot_w, slot_h = self.width / cols, content_h / rows
         cells = {}
         for i, p in enumerate(active):
             r, c = divmod(i, cols)
-            x = (self.WIDTH - cw) // 2 if len(active) == 1 else c * cw
-            cells[p] = (x, self.toolbar_h + r * ch, cw, ch)
+            in_row = min(cols, n - r * cols)          # centre a short last row
+            x_off = (self.width - in_row * slot_w) / 2
+            x = int(x_off + c * slot_w + (slot_w - cw) / 2)
+            y = int(self.toolbar_h + r * slot_h + (slot_h - ch) / 2)
+            cells[p] = (x, y, cw, ch)
         self.cells = cells
-        return cells, math.ceil(len(active) / cols) * ch
+        return cells
 
     def pane_at(self, x, y):
         for p, (cx, cy, cw, ch) in self.cells.items():
@@ -330,7 +352,8 @@ class Gui:
         elif event == cv2.EVENT_LBUTTONUP:
             self.drag = self.slider_drag = None
         elif event == cv2.EVENT_MOUSEWHEEL and pane == "cloud":
-            self.zoom_by(0.88 if cv2.getMouseWheelDelta(flags) > 0 else 1 / 0.88)
+            # The wheel delta is carried in the sign of flags (positive = scroll up / away).
+            self.zoom_by(0.88 if flags > 0 else 1 / 0.88)
 
 
 def render_cloud(pts, cols, gui, pivot_z, w, h, f, splat=2):
@@ -415,7 +438,12 @@ def run(args, cam, model, dev):
     gui = Gui(args)
     luts = {name: torch.from_numpy(lut).to(dev) for name, lut in gui.luts.items()}
     window = "PS3 Eye depth"
-    cv2.namedWindow(window, cv2.WINDOW_AUTOSIZE)
+    # Resizable window without OpenCV's own toolbar. The canvas is redrawn at the window's
+    # size every frame, so it is shown 1:1 and mouse coordinates need no scaling.
+    cv2.namedWindow(window, cv2.WINDOW_NORMAL | getattr(cv2, "WINDOW_GUI_NORMAL", 0))
+    cv2.resizeWindow(window, 1280, 800)
+    aspect = cam.width / cam.height
+    fullscreen_applied = False
     cv2.setMouseCallback(window, gui.on_mouse)
 
     vis = pcd = o3d = None
@@ -476,8 +504,20 @@ def run(args, cam, model, dev):
             level = 255 - level  # near = top of the colour map
         lut = luts[gui.cmap]
 
-        cells, content_h = gui.layout()
-        canvas = np.zeros((gui.toolbar_h + content_h + gui.STATUS, gui.WIDTH, 3), np.uint8)
+        if gui.fullscreen != fullscreen_applied:
+            cv2.setWindowProperty(window, cv2.WND_PROP_FULLSCREEN,
+                                  cv2.WINDOW_FULLSCREEN if gui.fullscreen else cv2.WINDOW_NORMAL)
+            fullscreen_applied = gui.fullscreen
+        try:
+            win_w, win_h = cv2.getWindowImageRect(window)[2:]
+        except cv2.error:
+            win_w = win_h = 0
+        if win_w <= 0 or win_h <= 0:  # window not mapped yet, or backend cannot tell
+            win_w, win_h = 1280, 800
+        gui.resize(max(win_w, gui.MIN_WIDTH))
+        canvas_h = max(win_h, gui.toolbar_h + gui.MIN_CONTENT + gui.STATUS)
+        cells = gui.layout(canvas_h - gui.toolbar_h - gui.STATUS, aspect)
+        canvas = np.zeros((canvas_h, gui.width, 3), np.uint8)
         canvas[: gui.toolbar_h] = gui.draw_toolbar()
 
         # Probe point: under the cursor when it is over an image view, else the centre.
@@ -509,7 +549,9 @@ def run(args, cam, model, dev):
                 view, text = compute_normals(pts).cpu().numpy(), "Normals"
             else:
                 colours = depth_bgr if gui.cloud_depth_colour else bgr_small
-                view = render_cloud(pts[keep], colours[keep], gui, pivot_z, cw, ch, fx * cw / mw).cpu().numpy()
+                # Bigger splats when the view is larger than the depth map or zoomed in, to avoid holes.
+                splat = min(6, max(2, math.ceil(1.6 * cw / mw / min(max(gui.zoom, 0.4), 1.0))))
+                view = render_cloud(pts[keep], colours[keep], gui, pivot_z, cw, ch, fx * cw / mw, splat).cpu().numpy()
                 text = "Point cloud (drag: orbit, wheel: zoom)"
             if view.shape[:2] != (ch, cw):
                 view = cv2.resize(view, (cw, ch), interpolation=cv2.INTER_LINEAR)
@@ -556,8 +598,12 @@ def run(args, cam, model, dev):
             vis.update_renderer()
 
         key = cv2.waitKey(1) & 0xFF
+        if key == 27 and gui.fullscreen:
+            gui.fullscreen, key = False, 255
         if key in (ord("q"), 27) or "quit" in gui.pending:
             break
+        if key == ord("f"):
+            gui.fullscreen = not gui.fullscreen
         if shown and cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1:
             break
         if ord("1") <= key <= ord("6"):
@@ -612,6 +658,7 @@ def parse_args(argv=None):
     ap.add_argument("--colormap", choices=list(COLORMAPS), default="inferno", help="starting colour map")
     ap.add_argument("--invert", action="store_true", help="map far to the top of the colour map instead of near")
     ap.add_argument("--auto-range", action="store_true", help="stretch the colour scale to the scene's depth range")
+    ap.add_argument("--fullscreen", action="store_true", help="start in fullscreen (f or the toolbar button toggles)")
     ap.add_argument("--open3d", action="store_true", help="also open a separate Open3D point cloud window")
     args = ap.parse_args(argv)
     args.views = [v.strip() for v in args.views.split(",") if v.strip()]

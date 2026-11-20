@@ -34,10 +34,11 @@ Everything is selectable with the mouse in the window's toolbar:
 - **Invert**, **Auto range** (stretch colours to what is actually inside the range),
   **Cloud colour: depth**, **Reset view**, **Save** (`.ply` cloud, `.npy` depth, `.png` view).
 
-Hover over a view to read the distance under the cursor in the status bar.
+Hover over a view to read the distance under the cursor in the status bar. The window can be
+resized, maximised or made fullscreen (**Fullscreen** button, `f`, or `--fullscreen`); views scale to fit.
 
 Keys: `1`-`6` toggle views, `c` next colour map, `i` invert, `a` auto range, `r` reset cloud view,
-`+`/`-` zoom, `[` `]` far limit, `;` `'` near limit, `s` save, `q` quit. Starting state: `--views camera,depth,cloud --colormap jet`.
+`+`/`-` zoom, `[` `]` far limit, `;` `'` near limit, `f` fullscreen, `s` save, `q` quit. Starting state: `--views camera,depth,cloud --colormap jet`.
 
 The confidence view is an estimate, not a model output: Depth Anything V2 does not predict
 confidence, so it is derived from depth discontinuities and frame-to-frame stability.
