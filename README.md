@@ -52,6 +52,9 @@ Run any script with `--help` for all options.
 
 ## Notes
 
+- The viewer window uses pygame (SDL), not OpenCV's own window, whose Qt backend zooms the whole
+  image on mouse wheel. `calibrate.py` still uses an OpenCV window.
+
 - `large` gives the best quality; build `--encoder small` for the camera's full 60 FPS.
 - Monocular metric depth is approximate. Correct a consistent offset with `--depth-scale`.
 - If depth looks broken, rebuild the engine with `--fp32`.

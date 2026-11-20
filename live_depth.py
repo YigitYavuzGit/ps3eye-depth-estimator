@@ -18,6 +18,7 @@ double-click any view to enlarge it).
 """
 import argparse
 import math
+import os
 import threading
 import time
 
@@ -159,6 +160,7 @@ class Gui:
         self.fullscreen = args.fullscreen
         self.layout_mode = args.layout
         self.main = None  # the big view in the focus layout
+        self.promoted = None
         self.panes = {p: p in args.views for p in PANES}
         self.cmap = args.colormap
         self.invert = args.invert
@@ -359,6 +361,7 @@ class Gui:
         self.mouse = (x, y)
         pane = self.pane_at(x, y)[0]
         if event == cv2.EVENT_LBUTTONDOWN:
+            self.promoted = None
             if self.slider_y0 <= y < self.toolbar_h:
                 # Grab whichever handle is closer to the click.
                 dn, df = abs(x - self._slider_x(self.near)), abs(x - self._slider_x(self.far))
@@ -370,12 +373,14 @@ class Gui:
                         self._click(kind, value)
                         break
             elif self.layout_mode == "focus" and pane and pane != self.main:
-                self.main = pane  # clicking a small view makes it the big one
+                self.main = self.promoted = pane  # clicking a small view makes it the big one
             elif pane == "cloud":
                 self.drag = (x, y)
         elif event == cv2.EVENT_LBUTTONDBLCLK and pane:
             # Double-click a view to enlarge it; double-click the big view to go back to the grid.
-            if self.layout_mode == "focus" and pane == self.main:
+            if pane == self.promoted:
+                pass  # second half of the click that just enlarged this view
+            elif self.layout_mode == "focus" and pane == self.main:
                 self.layout_mode = "grid"
             else:
                 self.layout_mode, self.main = "focus", pane
@@ -390,6 +395,88 @@ class Gui:
         elif event == cv2.EVENT_MOUSEWHEEL and pane == "cloud":
             # The wheel delta is carried in the sign of flags (positive = scroll up / away).
             self.zoom_by(0.88 if flags > 0 else 1 / 0.88)
+
+
+class Window:
+    """The application window, on SDL through pygame. OpenCV's own window is not used: its Qt
+    backend zooms the whole image on mouse wheel and offers no way to turn that off, and it
+    does not report the window size reliably."""
+
+    DOUBLE_CLICK = 0.35  # seconds
+
+    def __init__(self, title, gui):
+        os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+        import pygame
+
+        self.pg, self.gui = pygame, gui
+        pygame.display.init()
+        pygame.display.set_caption(title)
+        self.windowed_size = (1280, 900)
+        self.fullscreen = None
+        self.scale = (1.0, 1.0)
+        self.last_click = (0.0, 0, 0)
+        self.set_fullscreen(gui.fullscreen)
+
+    def set_fullscreen(self, on):
+        if on == self.fullscreen:
+            return
+        pg = self.pg
+        if on:
+            if self.fullscreen is not None:
+                self.windowed_size = self.screen.get_size()
+            self.screen = pg.display.set_mode((0, 0), pg.FULLSCREEN)  # desktop resolution
+        else:
+            self.screen = pg.display.set_mode(self.windowed_size, pg.RESIZABLE)
+            if self.screen.get_size() != self.windowed_size:
+                # Straight out of fullscreen SDL can keep the fullscreen size; asking again restores it.
+                self.screen = pg.display.set_mode(self.windowed_size, pg.RESIZABLE)
+        self.fullscreen = on
+
+    def size(self):
+        self.screen = self.pg.display.get_surface()
+        return self.screen.get_size()
+
+    def _canvas_xy(self, pos):
+        return int(pos[0] * self.scale[0]), int(pos[1] * self.scale[1])
+
+    def poll(self):
+        """Forwards mouse events to the GUI. Returns (typed characters, window closed)."""
+        pg, gui = self.pg, self.gui
+        keys, closed = [], False
+        for e in pg.event.get():
+            if e.type == pg.QUIT:
+                closed = True
+            elif e.type == pg.KEYDOWN:
+                keys.append("\x1b" if e.key == pg.K_ESCAPE else e.unicode)
+            elif e.type == pg.MOUSEBUTTONDOWN and e.button == 1:
+                x, y = self._canvas_xy(e.pos)
+                now = time.perf_counter()
+                t, px, py = self.last_click
+                double = now - t < self.DOUBLE_CLICK and abs(x - px) < 6 and abs(y - py) < 6
+                self.last_click = (0.0 if double else now, x, y)
+                gui.on_mouse(cv2.EVENT_LBUTTONDBLCLK if double else cv2.EVENT_LBUTTONDOWN, x, y, cv2.EVENT_FLAG_LBUTTON)
+            elif e.type == pg.MOUSEBUTTONUP and e.button == 1:
+                gui.on_mouse(cv2.EVENT_LBUTTONUP, *self._canvas_xy(e.pos), 0)
+            elif e.type == pg.MOUSEMOTION:
+                gui.on_mouse(cv2.EVENT_MOUSEMOVE, *self._canvas_xy(e.pos), cv2.EVENT_FLAG_LBUTTON if e.buttons[0] else 0)
+            elif e.type == pg.MOUSEWHEEL and e.y:
+                # Applies to the view under the pointer (last position the GUI saw).
+                gui.on_mouse(cv2.EVENT_MOUSEWHEEL, *gui.mouse, 1 if e.y > 0 else -1)
+        return keys, closed
+
+    def show(self, canvas):
+        """Displays a BGR canvas. It normally matches the window 1:1; a window smaller than
+        the GUI's minimum size gets a scaled-down copy, with mouse positions scaled back."""
+        w, h = self.size()
+        self.scale = (canvas.shape[1] / w, canvas.shape[0] / h)
+        if (canvas.shape[1], canvas.shape[0]) != (w, h):
+            canvas = cv2.resize(canvas, (w, h), interpolation=cv2.INTER_AREA)
+        rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+        self.screen.blit(self.pg.image.frombuffer(rgb, (w, h), "RGB"), (0, 0))
+        self.pg.display.flip()
+
+    def close(self):
+        self.pg.display.quit()
 
 
 def render_cloud(pts, cols, gui, pivot_z, w, h, f, splat=2):
@@ -473,16 +560,8 @@ def run(args, cam, model, dev):
 
     gui = Gui(args)
     luts = {name: torch.from_numpy(lut).to(dev) for name, lut in gui.luts.items()}
-    window = "PS3 Eye depth"
-    # Resizable window without OpenCV's own toolbar. The canvas is redrawn at the window's
-    # size every frame, so it is shown 1:1 and mouse coordinates need no scaling.
-    # FREERATIO matters: with the default keep-ratio mode the image is letterboxed inside the
-    # window and the reported image size never grows to the window's real size.
-    cv2.namedWindow(window, cv2.WINDOW_NORMAL | cv2.WINDOW_FREERATIO | getattr(cv2, "WINDOW_GUI_NORMAL", 0))
-    cv2.resizeWindow(window, 1280, 900)
+    win = Window("PS3 Eye depth", gui)
     aspect = cam.width / cam.height
-    fullscreen_applied = False
-    cv2.setMouseCallback(window, gui.on_mouse)
 
     vis = pcd = o3d = None
     if args.open3d:
@@ -499,7 +578,6 @@ def run(args, cam, model, dev):
     lo, hi = gui.near, gui.far      # depth range the colours span
     pivot_z = 2.0                   # orbit centre of the cloud preview
     seq, fps, t_prev = 0, 0.0, time.perf_counter()
-    shown = False
     while True:
         frame, seq = cam.read(seq)
         if undistort_maps is not None:
@@ -542,16 +620,9 @@ def run(args, cam, model, dev):
             level = 255 - level  # near = top of the colour map
         lut = luts[gui.cmap]
 
-        if gui.fullscreen != fullscreen_applied:
-            cv2.setWindowProperty(window, cv2.WND_PROP_FULLSCREEN,
-                                  cv2.WINDOW_FULLSCREEN if gui.fullscreen else cv2.WINDOW_NORMAL)
-            fullscreen_applied = gui.fullscreen
-        try:
-            win_w, win_h = cv2.getWindowImageRect(window)[2:]
-        except cv2.error:
-            win_w = win_h = 0
-        if win_w <= 0 or win_h <= 0:  # window not mapped yet, or backend cannot tell
-            win_w, win_h = 1280, 900
+        # The canvas is drawn at the window's size every frame, so it is shown 1:1.
+        win.set_fullscreen(gui.fullscreen)
+        win_w, win_h = win.size()
         gui.resize(max(win_w, gui.min_width))
         canvas_h = max(win_h, gui.toolbar_h + gui.MIN_CONTENT + gui.STATUS)
         cells = gui.layout(canvas_h - gui.toolbar_h - gui.STATUS, aspect)
@@ -616,8 +687,7 @@ def run(args, cam, model, dev):
         status = (f"{fps:5.1f} FPS    {where}: {probe_depth:.2f} m, confidence {probe_conf:.2f}"
                   f"    colours {lo:.2f}-{hi:.2f} m    {int(keep.sum()):,} points")
         cv2.putText(canvas, status, (8, canvas.shape[0] - 7), FONT, 0.48, (210, 210, 210), 1, cv2.LINE_AA)
-        cv2.imshow(window, canvas)
-        shown = True
+        win.show(canvas)
 
         if vis is not None:
             pcd.points = o3d.utility.Vector3dVector((pts[keep] * y_up).double().cpu().numpy())
@@ -635,36 +705,40 @@ def run(args, cam, model, dev):
                 break
             vis.update_renderer()
 
-        key = cv2.waitKey(1) & 0xFF
-        if key == 27 and gui.fullscreen:
-            gui.fullscreen, key = False, 255
-        if key in (ord("q"), 27) or "quit" in gui.pending:
+        keys, closed = win.poll()
+        stop = closed or "quit" in gui.pending
+        for ch in keys:
+            if not ch:
+                continue
+            if ch == "\x1b" and gui.fullscreen:
+                gui.fullscreen = False
+            elif ch in ("q", "\x1b"):
+                stop = True
+            elif ch == "f":
+                gui.fullscreen = not gui.fullscreen
+            elif ch in "123456":
+                gui.toggle_pane(PANES[int(ch) - 1])
+            elif ch == "c":
+                gui.next_cmap()
+            elif ch == "l":
+                gui.next_layout()
+            elif ch == "i":
+                gui.invert = not gui.invert
+            elif ch == "a":
+                gui.auto_range = not gui.auto_range
+            elif ch == "r":
+                gui.reset_view()
+            elif ch in "+=":
+                gui.zoom_by(0.88)
+            elif ch == "-":
+                gui.zoom_by(1 / 0.88)
+            elif ch in "[]":
+                gui.set_range(far=gui.far + (0.25 if ch == "]" else -0.25))
+            elif ch in ";'":
+                gui.set_range(near=gui.near + (0.05 if ch == "'" else -0.05))
+        if stop:
             break
-        if key == ord("f"):
-            gui.fullscreen = not gui.fullscreen
-        if shown and cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1:
-            break
-        if ord("1") <= key <= ord("6"):
-            gui.toggle_pane(PANES[key - ord("1")])
-        elif key == ord("c"):
-            gui.next_cmap()
-        elif key == ord("l"):
-            gui.next_layout()
-        elif key == ord("i"):
-            gui.invert = not gui.invert
-        elif key == ord("a"):
-            gui.auto_range = not gui.auto_range
-        elif key == ord("r"):
-            gui.reset_view()
-        elif key in (ord("+"), ord("=")):
-            gui.zoom_by(0.88)
-        elif key == ord("-"):
-            gui.zoom_by(1 / 0.88)
-        elif key in (ord("["), ord("]")):
-            gui.set_range(far=gui.far + (0.25 if key == ord("]") else -0.25))
-        elif key in (ord(";"), ord("'")):
-            gui.set_range(near=gui.near + (0.05 if key == ord("'") else -0.05))
-        if key == ord("s") or "save" in gui.pending:
+        if "s" in keys or "save" in gui.pending:
             stamp = time.strftime("%Y%m%d_%H%M%S")
             np.save(f"depth_{stamp}.npy", depth.cpu().numpy())
             cv2.imwrite(f"view_{stamp}.png", canvas)
@@ -672,6 +746,7 @@ def run(args, cam, model, dev):
             print(f"Saved depth_{stamp}.npy, cloud_{stamp}.ply, view_{stamp}.png")
         gui.pending.clear()
 
+    win.close()
     if vis is not None:
         vis.destroy_window()
 
@@ -721,7 +796,6 @@ def main():
         run(args, cam, model, torch.device("cuda"))
     finally:
         cam.close()
-        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
