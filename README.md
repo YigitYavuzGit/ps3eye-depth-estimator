@@ -23,8 +23,23 @@ python calibrate.py --cols 9 --rows 6 --square 0.025
 python live_depth.py --engine da2_metric_large.engine --calib calib.npz
 ```
 
-In the image window: `c` cycles the depth colour map (jet, rainbow, turbo, ...), `i` inverts it,
-`s` saves a `.ply` cloud and `.npy` depth, `q` quits. Pick the starting map with `--colormap jet`.
+Everything is selectable with the mouse in the window's toolbar:
+
+- **Views** (any combination, tiled): camera, depth, intensity, confidence, surface normals,
+  and a point cloud preview. In the point cloud view, drag to orbit and scroll to zoom.
+- **Colour map**: click a swatch (inferno, jet, rainbow, turbo, viridis, ... and grey).
+- **Invert**, **Auto range** (stretch colours to the scene instead of 0 to `--max-depth`),
+  **Cloud colour: depth**, **Reset view**, **Save** (`.ply` cloud, `.npy` depth, `.png` view).
+
+Hover over a view to read the distance under the cursor in the status bar.
+
+Keys: `1`-`6` toggle views, `c` next colour map, `i` invert, `a` auto range, `r` reset cloud view,
+`+`/`-` zoom, `s` save, `q` quit. Starting state: `--views camera,depth,cloud --colormap jet`.
+
+The confidence view is an estimate, not a model output: Depth Anything V2 does not predict
+confidence, so it is derived from depth discontinuities and frame-to-frame stability.
+`--min-conf 0.5` drops low-confidence points from the cloud. `--open3d` additionally opens a
+full Open3D point cloud window.
 Run any script with `--help` for all options.
 
 ## Notes

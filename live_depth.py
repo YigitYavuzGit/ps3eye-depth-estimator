@@ -3,8 +3,13 @@
 
     python live_depth.py --engine da2_metric_large.engine --calib calib.npz
 
-Keys (in the image window): q / Esc quit, s save cloud (.ply) + depth (.npy),
-c next colour map, i invert colour map.
+Everything is selectable with the mouse in the window's toolbar: which views are
+shown (camera, depth, intensity, confidence, normals, point cloud), the colour map,
+invert, auto range and the point cloud colouring. In the point cloud view, drag to
+orbit and scroll to zoom.
+
+Keys: 1-6 toggle views, c next colour map, i invert, a auto range, r reset cloud
+view, +/- zoom cloud, s save (.ply, .npy, .png), q / Esc quit.
 """
 import argparse
 import math
@@ -19,14 +24,26 @@ import torch.nn.functional as F
 MEAN = (0.485, 0.456, 0.406)
 STD = (0.229, 0.224, 0.225)
 
-# Depth colour maps, in the order the "c" key cycles through them.
-COLORMAPS = {
-    name: getattr(cv2, "COLORMAP_" + name.upper())
-    for name in ("inferno", "jet", "rainbow", "turbo", "viridis", "plasma", "magma", "hot",
-                 "cool", "hsv", "bone", "ocean", "parula", "cividis", "twilight")
-    if hasattr(cv2, "COLORMAP_" + name.upper())
-}
-COLORMAPS["gray"] = None  # plain greyscale
+# Every colour map OpenCV ships, common ones first. "gray" is plain greyscale.
+_CMAP_NAMES = ("inferno", "jet", "rainbow", "turbo", "viridis", "plasma", "magma", "hot", "cool", "hsv",
+               "bone", "ocean", "parula", "cividis", "twilight", "twilight_shifted", "autumn", "winter",
+               "spring", "summer", "pink", "deepgreen")
+COLORMAPS = {n: getattr(cv2, "COLORMAP_" + n.upper()) for n in _CMAP_NAMES if hasattr(cv2, "COLORMAP_" + n.upper())}
+COLORMAPS["gray"] = None
+
+PANES = ("camera", "depth", "intensity", "confidence", "normals", "cloud")
+PANE_LABELS = {"camera": "Camera", "depth": "Depth", "intensity": "Intensity",
+               "confidence": "Confidence", "normals": "Normals", "cloud": "Point cloud"}
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+ACCENT = (200, 140, 40)
+
+
+def colormap_lut(name):
+    """(256, 3) BGR lookup table for a colour map."""
+    ramp = np.arange(256, dtype=np.uint8).reshape(256, 1)
+    cmap = COLORMAPS[name]
+    lut = cv2.cvtColor(ramp, cv2.COLOR_GRAY2BGR) if cmap is None else cv2.applyColorMap(ramp, cmap)
+    return lut.reshape(256, 3)
 
 
 class Camera:
@@ -79,8 +96,11 @@ class TRTDepth:
         torch.zeros(1, device="cuda")  # make sure torch owns a CUDA context first
         self.logger = trt.Logger(trt.Logger.WARNING)
         self.runtime = trt.Runtime(self.logger)
-        with open(engine_path, "rb") as f:
-            self.engine = self.runtime.deserialize_cuda_engine(f.read())
+        try:
+            with open(engine_path, "rb") as f:
+                self.engine = self.runtime.deserialize_cuda_engine(f.read())
+        except FileNotFoundError:
+            raise SystemExit(f"{engine_path} not found - run build_engine.py first")
         if self.engine is None:
             raise SystemExit("Failed to load engine (built with another TensorRT version/GPU?)")
         self.context = self.engine.create_execution_context()
@@ -121,7 +141,400 @@ def load_intrinsics(args, cam_w, cam_h):
     return K, None
 
 
-def main():
+class Gui:
+    """Toolbar, view layout and mouse state for the single OpenCV window."""
+
+    WIDTH = 1280
+    ROW = 30
+    STATUS = 24
+
+    def __init__(self, args):
+        self.panes = {p: p in args.views for p in PANES}
+        self.cmap = args.colormap
+        self.invert = args.invert
+        self.auto_range = args.auto_range
+        self.cloud_depth_colour = False
+        self.yaw = self.pitch = 0.0
+        self.zoom = 1.0
+        self.mouse = (-1, -1)
+        self.drag = None
+        self.pending = []  # one-shot actions for the main loop: "save", "quit"
+        self.cells = {}
+        self.luts = {name: colormap_lut(name) for name in COLORMAPS}
+        self._build_buttons()
+
+    # ---- toolbar -------------------------------------------------------------
+    def _build_buttons(self):
+        self.buttons = []  # (x0, y0, x1, y1, kind, value, label)
+        x, pad = 6, 9
+
+        def add(kind, value, label, gap=4):
+            nonlocal x
+            w = cv2.getTextSize(label, FONT, 0.45, 1)[0][0] + 2 * pad
+            self.buttons.append((x, 3, x + w, self.ROW - 3, kind, value, label))
+            x += w + gap
+
+        for i, p in enumerate(PANES):
+            add("pane", p, PANE_LABELS[p], gap=18 if i == len(PANES) - 1 else 4)
+        add("toggle", "invert", "Invert")
+        add("toggle", "auto_range", "Auto range")
+        add("toggle", "cloud_depth_colour", "Cloud colour: depth", gap=18)
+        add("action", "reset", "Reset view")
+        add("action", "save", "Save")
+        add("action", "quit", "Quit")
+
+        names = list(COLORMAPS)
+        per_row = math.ceil(len(names) / 2)
+        bw = (self.WIDTH - 12) // per_row
+        for i, name in enumerate(names):
+            r, c = divmod(i, per_row)
+            x0, y0 = 6 + c * bw, self.ROW * (1 + r) + 2
+            self.buttons.append((x0, y0, x0 + bw - 3, y0 + self.ROW - 4, "cmap", name, name))
+        self.toolbar_h = self.ROW * 3 + 4
+
+    def _active(self, kind, value):
+        if kind == "pane":
+            return self.panes[value]
+        if kind == "toggle":
+            return getattr(self, value)
+        return False
+
+    def draw_toolbar(self):
+        bar = np.full((self.toolbar_h, self.WIDTH, 3), 30, np.uint8)
+        for x0, y0, x1, y1, kind, value, text in self.buttons:
+            if kind == "cmap":
+                swatch = self.luts[value].reshape(1, 256, 3)
+                bar[y0:y1, x0:x1] = cv2.resize(swatch, (x1 - x0, y1 - y0), interpolation=cv2.INTER_LINEAR)
+                short = text.replace("twilight_shifted", "twilight_s")
+                label(bar, short, (x0 + 5, y1 - 8), 0.42)
+                if value == self.cmap:
+                    cv2.rectangle(bar, (x0 - 1, y0 - 1), (x1, y1), (255, 255, 255), 2)
+                continue
+            on = self._active(kind, value)
+            cv2.rectangle(bar, (x0, y0), (x1, y1), ACCENT if on else (62, 62, 62), -1)
+            cv2.rectangle(bar, (x0, y0), (x1, y1), (110, 110, 110), 1)
+            cv2.putText(bar, text, (x0 + 9, y1 - 8), FONT, 0.45, (255, 255, 255) if on else (205, 205, 205), 1, cv2.LINE_AA)
+        return bar
+
+    def _click(self, kind, value):
+        if kind == "pane":
+            self.toggle_pane(value)
+        elif kind == "toggle":
+            setattr(self, value, not getattr(self, value))
+        elif kind == "cmap":
+            self.cmap = value
+        elif value == "reset":
+            self.reset_view()
+        else:
+            self.pending.append(value)
+
+    def toggle_pane(self, pane):
+        self.panes[pane] = not self.panes[pane]
+        if not any(self.panes.values()):
+            self.panes[pane] = True  # always keep one view
+
+    def next_cmap(self):
+        names = list(COLORMAPS)
+        self.cmap = names[(names.index(self.cmap) + 1) % len(names)]
+
+    def reset_view(self):
+        self.yaw = self.pitch = 0.0
+        self.zoom = 1.0
+
+    def zoom_by(self, factor):
+        self.zoom = min(max(self.zoom * factor, 0.15), 4.0)
+
+    # ---- layout and mouse ----------------------------------------------------
+    def layout(self):
+        """Tiles the enabled views; returns ({pane: (x, y, w, h)}, content height)."""
+        active = [p for p in PANES if self.panes[p]]
+        cols = 2 if len(active) <= 2 else 3
+        cw = self.WIDTH // cols
+        ch = cw * 3 // 4
+        cells = {}
+        for i, p in enumerate(active):
+            r, c = divmod(i, cols)
+            x = (self.WIDTH - cw) // 2 if len(active) == 1 else c * cw
+            cells[p] = (x, self.toolbar_h + r * ch, cw, ch)
+        self.cells = cells
+        return cells, math.ceil(len(active) / cols) * ch
+
+    def pane_at(self, x, y):
+        for p, (cx, cy, cw, ch) in self.cells.items():
+            if cx <= x < cx + cw and cy <= y < cy + ch:
+                return p, (x - cx) / cw, (y - cy) / ch
+        return None, 0.0, 0.0
+
+    def on_mouse(self, event, x, y, flags, _param=None):
+        self.mouse = (x, y)
+        pane = self.pane_at(x, y)[0]
+        if event == cv2.EVENT_LBUTTONDOWN:
+            if y < self.toolbar_h:
+                for x0, y0, x1, y1, kind, value, _ in self.buttons:
+                    if x0 <= x <= x1 and y0 <= y <= y1:
+                        self._click(kind, value)
+                        break
+            elif pane == "cloud":
+                self.drag = (x, y)
+        elif event == cv2.EVENT_MOUSEMOVE and self.drag and flags & cv2.EVENT_FLAG_LBUTTON:
+            self.yaw -= (x - self.drag[0]) * 0.008
+            self.pitch = min(max(self.pitch + (y - self.drag[1]) * 0.008, -1.45), 1.45)
+            self.drag = (x, y)
+        elif event == cv2.EVENT_LBUTTONUP:
+            self.drag = None
+        elif event == cv2.EVENT_MOUSEWHEEL and pane == "cloud":
+            self.zoom_by(0.88 if cv2.getMouseWheelDelta(flags) > 0 else 1 / 0.88)
+
+
+def render_cloud(pts, cols, gui, pivot_z, w, h, f, splat=2):
+    """Z-buffered point splatting on the GPU. pts (N,3) in camera coords (x right, y down,
+    z forward), cols (N,3) uint8 BGR. The virtual camera orbits a pivot on the optical axis."""
+    img = torch.full((h * w, 3), 18, dtype=torch.uint8, device=pts.device)
+    if pts.shape[0] == 0:
+        return img.view(h, w, 3)
+    cy, sy, cp, sp = math.cos(gui.yaw), math.sin(gui.yaw), math.cos(gui.pitch), math.sin(gui.pitch)
+    rot = pts.new_tensor([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]]) @ pts.new_tensor([[1, 0, 0], [0, cp, -sp], [0, sp, cp]])
+    p = (pts - pts.new_tensor([0.0, 0.0, pivot_z])) @ rot.T
+    z = p[:, 2] + pivot_z * gui.zoom
+    front = z > 0.05
+    zc = z.clamp_min(0.05)
+    ui = (f * p[:, 0] / zc + w / 2).clamp(-1e6, 1e6).floor().long()
+    vi = (f * p[:, 1] / zc + h / 2).clamp(-1e6, 1e6).floor().long()
+    idx, zz, cc = [], [], []
+    for oy in range(splat):
+        for ox in range(splat):
+            uu, vv = ui + ox, vi + oy
+            m = front & (uu >= 0) & (uu < w) & (vv >= 0) & (vv < h)
+            idx.append((vv * w + uu)[m])
+            zz.append(z[m])
+            cc.append(cols[m])
+    idx, zz, cc = torch.cat(idx), torch.cat(zz), torch.cat(cc)
+    zbuf = torch.full((h * w,), float("inf"), device=pts.device).scatter_reduce(0, idx, zz, reduce="amin")
+    nearest = zz <= zbuf[idx]
+    img[idx[nearest]] = cc[nearest]
+    return img.view(h, w, 3)
+
+
+def compute_normals(pts):
+    """Surface normals from the point map, as a BGR uint8 image (camera-facing = blue-ish)."""
+    mh, mw = pts.shape[:2]
+    dx = pts[1:-1, 2:] - pts[1:-1, :-2]
+    dy = pts[2:, 1:-1] - pts[:-2, 1:-1]
+    n = -F.normalize(torch.linalg.cross(dx, dy), dim=-1)  # point towards the camera
+    out = torch.zeros(mh, mw, 3, dtype=torch.uint8, device=pts.device)
+    bgr = torch.stack((-n[..., 2], -n[..., 1], n[..., 0]), dim=-1)
+    out[1:-1, 1:-1] = ((bgr * 0.5 + 0.5).clamp(0, 1) * 255).byte()
+    return out
+
+
+def write_ply(path, points, colours_rgb):
+    """Binary PLY with float32 xyz and uint8 rgb."""
+    vertex = np.empty(len(points), dtype=[("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
+                                          ("red", "u1"), ("green", "u1"), ("blue", "u1")])
+    vertex["x"], vertex["y"], vertex["z"] = points[:, 0], points[:, 1], points[:, 2]
+    vertex["red"], vertex["green"], vertex["blue"] = colours_rgb[:, 0], colours_rgb[:, 1], colours_rgb[:, 2]
+    header = ("ply\nformat binary_little_endian 1.0\n"
+              f"element vertex {len(points)}\n"
+              "property float x\nproperty float y\nproperty float z\n"
+              "property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n")
+    with open(path, "wb") as f:
+        f.write(header.encode("ascii"))
+        f.write(vertex.tobytes())
+
+
+def label(img, text, org=(8, 20), scale=0.5):
+    """White text with a black outline. The outline is drawn as shifted copies because a
+    thicker stroke changes glyph spacing in newer OpenCV and would not line up."""
+    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1), (1, 1)):
+        cv2.putText(img, text, (org[0] + dx, org[1] + dy), FONT, scale, (0, 0, 0), 1, cv2.LINE_AA)
+    cv2.putText(img, text, org, FONT, scale, (255, 255, 255), 1, cv2.LINE_AA)
+
+
+def run(args, cam, model, dev):
+    mh, mw = model.height, model.width
+    K, undistort_maps = load_intrinsics(args, cam.width, cam.height)
+    # Everything 3D runs at model resolution, so scale the intrinsics to it.
+    fx, fy = K[0, 0] * mw / cam.width, K[1, 1] * mh / cam.height
+    cx, cy = K[0, 2] * mw / cam.width, K[1, 2] * mh / cam.height
+    v, u = torch.meshgrid(torch.arange(mh, device=dev), torch.arange(mw, device=dev), indexing="ij")
+    # Camera coordinates: x right, y down, z forward.
+    rays = torch.stack(((u + 0.5 - cx) / fx, (v + 0.5 - cy) / fy, torch.ones(mh, mw, device=dev)), dim=-1).float()
+    stride_mask = torch.zeros(mh, mw, dtype=torch.bool, device=dev)
+    stride_mask[:: args.stride, :: args.stride] = True
+    mean = torch.tensor(MEAN, device=dev).view(1, 3, 1, 1)
+    std = torch.tensor(STD, device=dev).view(1, 3, 1, 1)
+    y_up = torch.tensor([1.0, -1.0, -1.0], device=dev)  # export convention: +Y up, camera looks down -Z
+
+    gui = Gui(args)
+    luts = {name: torch.from_numpy(lut).to(dev) for name, lut in gui.luts.items()}
+    window = "PS3 Eye depth"
+    cv2.namedWindow(window, cv2.WINDOW_AUTOSIZE)
+    cv2.setMouseCallback(window, gui.on_mouse)
+
+    vis = pcd = o3d = None
+    if args.open3d:
+        import open3d as o3d
+
+        vis = o3d.visualization.Visualizer()
+        vis.create_window("Point cloud (Open3D)", 960, 720)
+        vis.get_render_option().point_size = 2.0
+        vis.get_render_option().background_color = np.array([0.05, 0.05, 0.07])
+        pcd = o3d.geometry.PointCloud()
+    cloud_added = False
+
+    ema = None                      # temporal average of depth, for the confidence estimate
+    lo, hi = 0.0, args.max_depth    # displayed depth range
+    pivot_z = 2.0                   # orbit centre of the cloud preview
+    seq, fps, t_prev = 0, 0.0, time.perf_counter()
+    shown = False
+    while True:
+        frame, seq = cam.read(seq)
+        if undistort_maps is not None:
+            frame = cv2.remap(frame, undistort_maps[0], undistort_maps[1], cv2.INTER_LINEAR)
+
+        # Preprocess on GPU: BGR uint8 -> RGB float, resize, normalise.
+        img = torch.from_numpy(frame).to(dev).permute(2, 0, 1).flip(0).unsqueeze(0).float().div_(255)
+        rgb = F.interpolate(img, size=(mh, mw), mode="bilinear", align_corners=False)
+        model.input.copy_((rgb - mean) / std)
+        depth = model.infer() * args.depth_scale  # (mh, mw) metres
+
+        # Confidence. The model does not output one, so this is a heuristic in [0, 1]:
+        # low where depth jumps between neighbouring pixels (object boundaries, where
+        # monocular depth smears) and where it is unstable from frame to frame.
+        d4 = depth.view(1, 1, mh, mw)
+        safe = depth.clamp_min(1e-3)
+        rel_edge = ((F.max_pool2d(d4, 3, 1, 1) + F.max_pool2d(-d4, 3, 1, 1)).view(mh, mw)) / safe
+        if ema is None:
+            ema = depth.clone()
+        rel_time = (depth - ema).abs() / safe
+        ema = torch.lerp(ema, depth, 0.3)
+        in_range = (depth > args.min_depth) & (depth < args.max_depth)
+        conf = torch.exp(-(rel_edge / 0.08) ** 2) * torch.exp(-(rel_time / 0.05) ** 2) * in_range
+
+        valid = in_range & (conf >= args.min_conf)
+        if args.edge_thresh > 0:
+            valid &= rel_edge < args.edge_thresh
+        pts = rays * depth.unsqueeze(-1)
+
+        # Displayed depth range: fixed, or the 2nd-98th percentile of the scene (smoothed).
+        if gui.auto_range:
+            q = torch.quantile(depth[::4, ::4].flatten(), torch.tensor([0.02, 0.98], device=dev))
+            lo, hi = 0.8 * lo + 0.2 * float(q[0]), 0.8 * hi + 0.2 * float(q[1])
+        else:
+            lo, hi = 0.0, args.max_depth
+        level = ((depth - lo) / max(hi - lo, 1e-3)).clamp(0, 1).mul(255).long()
+        if not gui.invert:
+            level = 255 - level  # near = top of the colour map
+        lut = luts[gui.cmap]
+
+        cells, content_h = gui.layout()
+        canvas = np.zeros((gui.toolbar_h + content_h + gui.STATUS, gui.WIDTH, 3), np.uint8)
+        canvas[: gui.toolbar_h] = gui.draw_toolbar()
+
+        # Probe point: under the cursor when it is over an image view, else the centre.
+        probe_pane, px, py = gui.pane_at(*gui.mouse)
+        if probe_pane in (None, "cloud"):
+            px = py = 0.5
+        pu, pv = min(int(px * mw), mw - 1), min(int(py * mh), mh - 1)
+        probe_depth, probe_conf = float(depth[pv, pu]), float(conf[pv, pu])
+
+        depth_bgr = lut[level] if ("depth" in cells or gui.cloud_depth_colour) else None
+        keep = valid & stride_mask
+        bgr_small = (rgb[0].permute(1, 2, 0).flip(-1) * 255).byte()
+        if int(keep.sum()):
+            pivot_z = 0.9 * pivot_z + 0.1 * float(depth[keep].median())
+
+        for pane, (x0, y0, cw, ch) in cells.items():
+            if pane == "camera":
+                view, text = frame, "Camera"
+            elif pane == "depth":
+                view, text = depth_bgr.cpu().numpy(), f"Depth ({gui.cmap})"
+            elif pane == "intensity":
+                view, text = cv2.cvtColor(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR), "Intensity"
+            elif pane == "confidence":
+                view, text = lut[conf.mul(255).long()].cpu().numpy(), "Confidence (estimated)"
+            elif pane == "normals":
+                view, text = compute_normals(pts).cpu().numpy(), "Normals"
+            else:
+                colours = depth_bgr if gui.cloud_depth_colour else bgr_small
+                view = render_cloud(pts[keep], colours[keep], gui, pivot_z, cw, ch, fx * cw / mw).cpu().numpy()
+                text = "Point cloud (drag: orbit, wheel: zoom)"
+            if view.shape[:2] != (ch, cw):
+                view = cv2.resize(view, (cw, ch), interpolation=cv2.INTER_LINEAR)
+            tile = canvas[y0:y0 + ch, x0:x0 + cw]
+            tile[:] = view
+            label(tile, text)
+            if pane != "cloud":
+                cv2.drawMarker(tile, (int(px * cw), int(py * ch)), (0, 255, 0), cv2.MARKER_CROSS, 14, 1)
+            if pane in ("depth", "confidence"):
+                # Colour bar with the value range.
+                top, bottom = (lo, hi) if pane == "depth" else (1.0, 0.0)
+                ramp = np.linspace(0, 255, ch - 60).astype(np.int64)
+                if pane == "confidence" or not gui.invert:
+                    ramp = 255 - ramp
+                tile[40:ch - 20, cw - 22:cw - 10] = gui.luts[gui.cmap][ramp][:, None, :]
+                unit = " m" if pane == "depth" else ""
+                label(tile, f"{top:.1f}{unit}", (cw - 62, 34), 0.42)
+                label(tile, f"{bottom:.1f}{unit}", (cw - 62, ch - 6), 0.42)
+
+        now = time.perf_counter()
+        inst = 1.0 / max(now - t_prev, 1e-6)
+        fps, t_prev = (0.9 * fps + 0.1 * inst if fps else inst), now
+        where = "centre" if probe_pane in (None, "cloud") else "cursor"
+        status = (f"{fps:5.1f} FPS    {where}: {probe_depth:.2f} m, confidence {probe_conf:.2f}"
+                  f"    range {lo:.1f}-{hi:.1f} m    {int(keep.sum()):,} points")
+        cv2.putText(canvas, status, (8, canvas.shape[0] - 7), FONT, 0.48, (210, 210, 210), 1, cv2.LINE_AA)
+        cv2.imshow(window, canvas)
+        shown = True
+
+        if vis is not None:
+            pcd.points = o3d.utility.Vector3dVector((pts[keep] * y_up).double().cpu().numpy())
+            pcd.colors = o3d.utility.Vector3dVector(rgb[0].permute(1, 2, 0)[keep].double().cpu().numpy())
+            if not cloud_added and len(pcd.points):
+                vis.add_geometry(pcd)
+                ctr = vis.get_view_control()
+                ctr.set_front([0.0, 0.0, 1.0])
+                ctr.set_up([0.0, 1.0, 0.0])
+                ctr.set_zoom(0.5)
+                cloud_added = True
+            elif cloud_added:
+                vis.update_geometry(pcd)
+            if not vis.poll_events():
+                break
+            vis.update_renderer()
+
+        key = cv2.waitKey(1) & 0xFF
+        if key in (ord("q"), 27) or "quit" in gui.pending:
+            break
+        if shown and cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1:
+            break
+        if ord("1") <= key <= ord("6"):
+            gui.toggle_pane(PANES[key - ord("1")])
+        elif key == ord("c"):
+            gui.next_cmap()
+        elif key == ord("i"):
+            gui.invert = not gui.invert
+        elif key == ord("a"):
+            gui.auto_range = not gui.auto_range
+        elif key == ord("r"):
+            gui.reset_view()
+        elif key in (ord("+"), ord("=")):
+            gui.zoom_by(0.88)
+        elif key == ord("-"):
+            gui.zoom_by(1 / 0.88)
+        if key == ord("s") or "save" in gui.pending:
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            np.save(f"depth_{stamp}.npy", depth.cpu().numpy())
+            cv2.imwrite(f"view_{stamp}.png", canvas)
+            write_ply(f"cloud_{stamp}.ply", (pts[keep] * y_up).cpu().numpy(), bgr_small[keep].flip(-1).cpu().numpy())
+            print(f"Saved depth_{stamp}.npy, cloud_{stamp}.ply, view_{stamp}.png")
+        gui.pending.clear()
+
+    if vis is not None:
+        vis.destroy_window()
+
+
+def parse_args(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engine", default="da2_metric_large.engine")
     ap.add_argument("--device", default=0, type=lambda v: int(v) if v.isdigit() else v, help="camera index or /dev/videoN")
@@ -132,130 +545,37 @@ def main():
     ap.add_argument("--hfov", type=float, default=60.0, help="horizontal FOV in degrees, used only without --calib")
     ap.add_argument("--depth-scale", type=float, default=1.0, help="multiply depth to correct metric scale")
     ap.add_argument("--min-depth", type=float, default=0.15)
-    ap.add_argument("--max-depth", type=float, default=8.0, help="metres; also the top of the colour scale")
+    ap.add_argument("--max-depth", type=float, default=8.0, help="metres; also the top of the fixed colour scale")
     ap.add_argument("--edge-thresh", type=float, default=0.05,
                     help="drop points where depth jumps by more than this fraction between pixels (0 = keep all)")
-    ap.add_argument("--colormap", choices=list(COLORMAPS), default="inferno", help="depth colour map (c cycles live)")
-    ap.add_argument("--invert", action="store_true",
-                    help="map far to the top of the colour map instead of near (i toggles live)")
+    ap.add_argument("--min-conf", type=float, default=0.0, help="drop points below this estimated confidence (0-1)")
     ap.add_argument("--stride", type=int, default=1, help="keep every Nth point per axis")
-    ap.add_argument("--point-size", type=float, default=2.0)
-    ap.add_argument("--no-cloud", action="store_true", help="depth image only (no Open3D window)")
-    args = ap.parse_args()
+    ap.add_argument("--views", default="camera,depth,cloud",
+                    help="comma-separated views shown at start: " + ", ".join(PANES))
+    ap.add_argument("--colormap", choices=list(COLORMAPS), default="inferno", help="starting colour map")
+    ap.add_argument("--invert", action="store_true", help="map far to the top of the colour map instead of near")
+    ap.add_argument("--auto-range", action="store_true", help="stretch the colour scale to the scene's depth range")
+    ap.add_argument("--open3d", action="store_true", help="also open a separate Open3D point cloud window")
+    args = ap.parse_args(argv)
+    args.views = [v.strip() for v in args.views.split(",") if v.strip()]
+    unknown = [v for v in args.views if v not in PANES]
+    if unknown or not args.views:
+        ap.error(f"--views must be a comma-separated list of: {', '.join(PANES)}")
+    return args
 
+
+def main():
+    args = parse_args()
     if not torch.cuda.is_available():
         raise SystemExit("CUDA not available to PyTorch")
-    dev = torch.device("cuda")
-
     model = TRTDepth(args.engine)
-    mh, mw = model.height, model.width
     cam = Camera(args.device, args.width, args.height, args.fps)
-    print(f"Camera {cam.width}x{cam.height}, model input {mw}x{mh}")
-
-    K, undistort_maps = load_intrinsics(args, cam.width, cam.height)
-    # Everything 3D runs at model resolution, so scale the intrinsics to it.
-    fx, fy = K[0, 0] * mw / cam.width, K[1, 1] * mh / cam.height
-    cx, cy = K[0, 2] * mw / cam.width, K[1, 2] * mh / cam.height
-    v, u = torch.meshgrid(torch.arange(mh, device=dev), torch.arange(mw, device=dev), indexing="ij")
-    # Y and Z flipped (OpenGL convention: +Y up, camera looks down -Z) so the cloud is upright in viewers.
-    rays = torch.stack(((u + 0.5 - cx) / fx, -(v + 0.5 - cy) / fy, -torch.ones_like(u, dtype=torch.float32)), dim=-1)
-    rays = rays.float()
-    stride_mask = torch.zeros(mh, mw, dtype=torch.bool, device=dev)
-    stride_mask[:: args.stride, :: args.stride] = True
-    mean = torch.tensor(MEAN, device=dev).view(1, 3, 1, 1)
-    std = torch.tensor(STD, device=dev).view(1, 3, 1, 1)
-
-    vis = pcd = None
-    if not args.no_cloud:
-        import open3d as o3d
-
-        vis = o3d.visualization.Visualizer()
-        vis.create_window("Point cloud", 960, 720)
-        opt = vis.get_render_option()
-        opt.point_size = args.point_size
-        opt.background_color = np.array([0.05, 0.05, 0.07])
-        pcd = o3d.geometry.PointCloud()
-    cloud_added = False
-    cmap_names = list(COLORMAPS)
-    cmap_idx, invert = cmap_names.index(args.colormap), args.invert
-
-    seq, fps, t_prev = 0, 0.0, time.perf_counter()
+    print(f"Camera {cam.width}x{cam.height}, model input {model.width}x{model.height}")
     try:
-        while True:
-            frame, seq = cam.read(seq)
-            if undistort_maps is not None:
-                frame = cv2.remap(frame, undistort_maps[0], undistort_maps[1], cv2.INTER_LINEAR)
-
-            # Preprocess on GPU: BGR uint8 -> RGB float, resize, normalise.
-            img = torch.from_numpy(frame).to(dev).permute(2, 0, 1).flip(0).unsqueeze(0).float().div_(255)
-            rgb = F.interpolate(img, size=(mh, mw), mode="bilinear", align_corners=False)
-            model.input.copy_((rgb - mean) / std)
-            depth = model.infer() * args.depth_scale  # (mh, mw) metres
-
-            valid = (depth > args.min_depth) & (depth < args.max_depth)
-            if args.edge_thresh > 0:
-                # Monocular depth smears across object boundaries; drop those "flying pixels".
-                d = depth.view(1, 1, mh, mw)
-                local_max = F.max_pool2d(d, 3, 1, 1)
-                local_min = -F.max_pool2d(-d, 3, 1, 1)
-                valid &= ((local_max - local_min) / d.clamp_min(1e-3)).view(mh, mw) < args.edge_thresh
-
-            depth_u8 = (depth / args.max_depth).clamp(0, 1).mul(255).byte().cpu().numpy()
-
-            points = colors = None
-            if vis is not None:
-                keep = valid & stride_mask
-                points = (rays * depth.unsqueeze(-1))[keep].double().cpu().numpy()
-                colors = rgb[0].permute(1, 2, 0)[keep].double().cpu().numpy()
-                pcd.points = o3d.utility.Vector3dVector(points)
-                pcd.colors = o3d.utility.Vector3dVector(colors)
-                if not cloud_added and len(points):
-                    vis.add_geometry(pcd)
-                    ctr = vis.get_view_control()
-                    ctr.set_front([0.0, 0.0, 1.0])
-                    ctr.set_up([0.0, 1.0, 0.0])
-                    ctr.set_zoom(0.5)
-                    cloud_added = True
-                elif cloud_added:
-                    vis.update_geometry(pcd)
-                if not vis.poll_events():
-                    break
-                vis.update_renderer()
-
-            now = time.perf_counter()
-            fps = 0.9 * fps + 0.1 / max(now - t_prev, 1e-6) if fps else 1.0 / max(now - t_prev, 1e-6)
-            t_prev = now
-
-            # Default: near = top of the colour map (bright / red), far = bottom.
-            scaled = depth_u8 if invert else 255 - depth_u8
-            cmap = COLORMAPS[cmap_names[cmap_idx]]
-            depth_vis = cv2.cvtColor(scaled, cv2.COLOR_GRAY2BGR) if cmap is None else cv2.applyColorMap(scaled, cmap)
-            depth_vis = cv2.resize(depth_vis, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_LINEAR)
-            centre = float(depth[mh // 2, mw // 2])
-            view = np.hstack((frame, depth_vis))
-            cv2.drawMarker(view, (frame.shape[1] // 2, frame.shape[0] // 2), (0, 255, 0), cv2.MARKER_CROSS, 14, 1)
-            cv2.putText(view, f"{fps:5.1f} FPS   centre {centre:.2f} m   {cmap_names[cmap_idx]}", (8, 22),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
-            cv2.imshow("PS3 Eye | depth", view)
-
-            key = cv2.waitKey(1) & 0xFF
-            if key in (ord("q"), 27):
-                break
-            if key == ord("c"):
-                cmap_idx = (cmap_idx + 1) % len(cmap_names)
-            elif key == ord("i"):
-                invert = not invert
-            if key == ord("s"):
-                stamp = time.strftime("%Y%m%d_%H%M%S")
-                np.save(f"depth_{stamp}.npy", depth.cpu().numpy())
-                if points is not None and len(points):
-                    o3d.io.write_point_cloud(f"cloud_{stamp}.ply", pcd)
-                print(f"Saved depth_{stamp}.npy" + (f" and cloud_{stamp}.ply" if points is not None else ""))
+        run(args, cam, model, torch.device("cuda"))
     finally:
         cam.close()
         cv2.destroyAllWindows()
-        if vis is not None:
-            vis.destroy_window()
 
 
 if __name__ == "__main__":
