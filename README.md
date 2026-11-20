@@ -51,6 +51,22 @@ confidence, so it is derived from depth discontinuities and frame-to-frame stabi
 full Open3D point cloud window.
 Run any script with `--help` for all options.
 
+## Tuning GPU load, speed and accuracy
+
+By default the viewer processes every camera frame (up to 60 per second), which keeps the GPU busy.
+
+| Knob | How | Effect |
+|---|---|---|
+| Frame-rate cap | **Max FPS** button, `t`, or `--max-fps 15` | GPU load drops roughly in proportion; no quality change per frame |
+| Model size | `build_engine.py --encoder small` / `base` / `large` | Smaller is much lighter and uses less GPU memory, with softer detail and less stable scale |
+| Input resolution | `build_engine.py --height 294 --width 392` (multiples of 14, keep 3:4) | Fewer pixels to process; coarser depth map and point cloud |
+| Camera rate | `--fps 30` | Fewer frames arrive in the first place |
+| Views | turn off Point cloud / Normals / Confidence | Skips their rendering work |
+| Cloud density | `--stride 2` | A quarter of the points |
+
+Engines for different settings can live side by side: add `--out name.engine` when building and
+pass that file to `live_depth.py --engine`.
+
 ## 6D object pose with FoundationPose (optional)
 
 The viewer can feed a local [FoundationPose](https://github.com/NVlabs/FoundationPose) install and

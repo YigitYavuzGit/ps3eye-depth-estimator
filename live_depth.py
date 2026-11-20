@@ -11,7 +11,7 @@ handles of the range slider). In the point cloud view, drag to orbit, right-drag
 
 Keys: 1-6 toggle views, c next colour map, i invert, a auto range, r reset cloud
 view, +/- zoom cloud, [ ] move the far limit, ; ' move the near limit,
-l next layout, f fullscreen, s save (.ply, .npy, .png), q / Esc quit (Esc leaves fullscreen first).
+l next layout, t next FPS cap, f fullscreen, s save (.ply, .npy, .png), q / Esc quit (Esc leaves fullscreen first).
 
 6D object pose (optional): start fp_server.py in your FoundationPose environment, then run
 this with --pose. Click "Select object", then click the object in the camera view: Segment
@@ -46,6 +46,7 @@ COLORMAPS = {n: getattr(cv2, "COLORMAP_" + n.upper()) for n in _CMAP_NAMES if ha
 COLORMAPS["gray"] = None
 
 LAYOUTS = ("grid", "stack", "focus")
+FPS_CAPS = (0, 30, 20, 15, 10)  # choices of the "Max FPS" button; 0 = as fast as the camera
 PANES = ("camera", "depth", "intensity", "confidence", "normals", "cloud")
 PANE_LABELS = {"camera": "Camera", "depth": "Depth", "intensity": "Intensity",
                "confidence": "Confidence", "normals": "Normals", "cloud": "Point cloud"}
@@ -167,6 +168,7 @@ class Gui:
         self.width = 1280
         self.fullscreen = args.fullscreen
         self.layout_mode = args.layout
+        self.fps_cap = args.max_fps   # 0 = unlimited
         self.main = None  # the big view in the focus layout
         self.promoted = None
         self.panes = {p: p in args.views for p in PANES}
@@ -213,6 +215,7 @@ class Gui:
         add("action", "reset", "Reset view")
         add("action", "save", "Save", gap=18)
         add("cycle", "layout", "Layout: focus")
+        add("cycle", "fps", "Max FPS: off")
         add("toggle", "fullscreen", "Fullscreen")
         add("action", "quit", "Quit", gap=18)
         if self.pose_enabled:
@@ -287,7 +290,8 @@ class Gui:
                     cv2.rectangle(bar, (x0 - 1, y0 - 1), (x1, y1), (255, 255, 255), 2)
                 continue
             if kind == "cycle":
-                text = f"Layout: {self.layout_mode}"
+                text = (f"Layout: {self.layout_mode}" if value == "layout"
+                        else f"Max FPS: {self.fps_cap:g}" if self.fps_cap else "Max FPS: off")
             on = self._active(kind, value)
             cv2.rectangle(bar, (x0, y0), (x1, y1), ACCENT if on else (62, 62, 62), -1)
             cv2.rectangle(bar, (x0, y0), (x1, y1), (110, 110, 110), 1)
@@ -303,7 +307,7 @@ class Gui:
         elif kind == "cmap":
             self.cmap = value
         elif kind == "cycle":
-            self.next_layout()
+            self.next_layout() if value == "layout" else self.next_fps_cap()
         elif value == "reset":
             self.reset_view()
         else:
@@ -369,6 +373,11 @@ class Gui:
                 cells[p] = fit(x_off + c * slot_w, top + r * slot_h, slot_w, slot_h)
         self.cells = cells
         return cells
+
+    def next_fps_cap(self):
+        """Steps to the next lower cap, wrapping back to unlimited."""
+        lower = [c for c in FPS_CAPS if c and (not self.fps_cap or c < self.fps_cap)]
+        self.fps_cap = max(lower) if lower else 0
 
     def next_layout(self):
         self.layout_mode = LAYOUTS[(LAYOUTS.index(self.layout_mode) + 1) % len(LAYOUTS)]
@@ -637,7 +646,14 @@ def run(args, cam, model, dev):
     lo, hi = gui.near, gui.far      # depth range the colours span
     pivot_z = 2.0                   # orbit centre of the cloud preview
     seq, fps, t_prev = 0, 0.0, time.perf_counter()
+    frame_start = 0.0
     while True:
+        # Frame-rate cap: idle here so the GPU is free between frames, then take the newest frame.
+        if gui.fps_cap:
+            delay = frame_start + 1.0 / gui.fps_cap - time.perf_counter()
+            if delay > 0:
+                time.sleep(delay)
+        frame_start = time.perf_counter()
         frame, seq = cam.read(seq)
         if undistort_maps is not None:
             frame = cv2.remap(frame, undistort_maps[0], undistort_maps[1], cv2.INTER_LINEAR)
@@ -813,6 +829,8 @@ def run(args, cam, model, dev):
                 gui.next_cmap()
             elif ch == "l":
                 gui.next_layout()
+            elif ch == "t":
+                gui.next_fps_cap()
             elif ch == "p" and tracker is not None:
                 gui.selecting = not gui.selecting
             elif ch == "o" and tracker is not None:
@@ -859,7 +877,9 @@ def parse_args(argv=None):
     ap.add_argument("--device", default=0, type=lambda v: int(v) if v.isdigit() else v, help="camera index or /dev/videoN")
     ap.add_argument("--width", type=int, default=640)
     ap.add_argument("--height", type=int, default=480)
-    ap.add_argument("--fps", type=int, default=60)
+    ap.add_argument("--fps", type=int, default=60, help="camera capture rate")
+    ap.add_argument("--max-fps", type=float, default=0,
+                    help="cap the processing rate to lower GPU load (0 = as fast as the camera; t cycles live)")
     ap.add_argument("--calib", default=None, help="calib.npz from calibrate.py")
     ap.add_argument("--hfov", type=float, default=60.0, help="horizontal FOV in degrees, used only without --calib")
     ap.add_argument("--depth-scale", type=float, default=1.0, help="multiply depth to correct metric scale")
