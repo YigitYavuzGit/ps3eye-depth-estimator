@@ -51,6 +51,52 @@ confidence, so it is derived from depth discontinuities and frame-to-frame stabi
 full Open3D point cloud window.
 Run any script with `--help` for all options.
 
+## 6D object pose with FoundationPose (optional)
+
+The viewer can feed a local [FoundationPose](https://github.com/NVlabs/FoundationPose) install and
+show the tracked object pose live. FoundationPose keeps its own environment; the two processes
+talk over a local socket.
+
+**1. In the FoundationPose environment**, start the bridge server (it only needs FoundationPose's
+own dependencies):
+
+```bash
+# model-based: you have a mesh of the object, in metres (--mesh-scale 0.001 for millimetres)
+python /path/to/ps3eye-depth-estimator/fp_server.py --fp-dir /path/to/FoundationPose --mesh object.obj
+
+# model-free: a folder of reference views in FoundationPose's ref-view format
+python /path/to/ps3eye-depth-estimator/fp_server.py --fp-dir /path/to/FoundationPose --ref-views /path/to/ob_0000001
+```
+
+**2. In this project's environment**, start the viewer with `--pose`:
+
+```bash
+python live_depth.py --engine da2_metric_large.engine --calib calib.npz --pose
+```
+
+Click **Select object** (`p`), then click the object in the camera view. Segment Anything turns
+the click into a mask (shown in green), FoundationPose estimates the pose from it and then tracks
+frame to frame. The oriented box and x/y/z axes (red/green/blue) are drawn on the camera and
+depth views; the status bar shows the position in metres and FoundationPose's time per frame.
+**Stop pose** (`o`) stops tracking; selecting again re-initialises it.
+
+Things to know:
+
+- FoundationPose is designed for depth-sensor depth. Here it gets estimated depth, whose absolute
+  scale can be several percent off and which flickers slightly. Because the mesh has a true size,
+  a scale error shows up as a worse fit and a wrong distance. Calibrate the camera and set
+  `--depth-scale` against a tape measure before judging the results.
+- Model-free mode trains FoundationPose's neural object field on the reference views the first
+  time (slow, needs its BundleSDF/Kaolin parts) and caches `model/model.obj` in that folder. The
+  reference views need a known camera pose per view (`cam_in_ob/`), which this viewer cannot
+  produce, so they have to come from elsewhere.
+- The first click downloads the Segment Anything checkpoint (`--sam-model`, default
+  `facebook/sam-vit-base`).
+- Depth, Segment Anything and FoundationPose all share one GPU, so expect a lower frame rate
+  than depth alone. `build_engine.py --encoder small` frees some of it.
+- `--pose-host` / `--pose-port` point the viewer at a server elsewhere; `fp_server.py --host`
+  controls which interface it listens on (this machine only by default).
+
 ## Notes
 
 - The viewer window uses pygame (SDL), not OpenCV's own window, whose Qt backend zooms the whole

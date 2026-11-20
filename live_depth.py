@@ -13,6 +13,11 @@ Keys: 1-6 toggle views, c next colour map, i invert, a auto range, r reset cloud
 view, +/- zoom cloud, [ ] move the far limit, ; ' move the near limit,
 l next layout, f fullscreen, s save (.ply, .npy, .png), q / Esc quit (Esc leaves fullscreen first).
 
+6D object pose (optional): start fp_server.py in your FoundationPose environment, then run
+this with --pose. Click "Select object", then click the object in the camera view: Segment
+Anything masks it, FoundationPose estimates its pose and tracks it from then on. The box and
+axes are drawn on the camera and depth views. p = select object, o = stop tracking.
+
 The window can be resized, maximised or made fullscreen; the views scale to fit.
 Layouts: grid, stack (vertical), focus (one big view; click a small view or
 double-click any view to enlarge it).
@@ -27,6 +32,8 @@ import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+import pose_protocol
 
 MEAN = (0.485, 0.456, 0.406)
 STD = (0.229, 0.224, 0.225)
@@ -178,6 +185,9 @@ class Gui:
         self.limit = max(args.range_limit, args.max_depth)
         self.near, self.far = args.min_depth, args.max_depth
         self.slider_drag = None
+        self.pose_enabled = args.pose
+        self.selecting = False   # next click on an image view picks the object to track
+        self.pick = None         # (fraction x, fraction y) of that click, consumed by the main loop
         self.pending = []  # one-shot actions for the main loop: "save", "quit"
         self.cells = {}
         self.luts = {name: colormap_lut(name) for name in COLORMAPS}
@@ -204,7 +214,10 @@ class Gui:
         add("action", "save", "Save", gap=18)
         add("cycle", "layout", "Layout: focus")
         add("toggle", "fullscreen", "Fullscreen")
-        add("action", "quit", "Quit")
+        add("action", "quit", "Quit", gap=18)
+        if self.pose_enabled:
+            add("toggle", "selecting", "Select object")
+            add("action", "stop_pose", "Stop pose")
         self.row1_end = x
 
         names = list(COLORMAPS)
@@ -381,6 +394,8 @@ class Gui:
                     if x0 <= x <= x1 and y0 <= y <= y1:
                         self._click(kind, value)
                         break
+            elif self.selecting and pane and pane != "cloud":
+                self.pick, self.selecting = self.pane_at(x, y)[1:], False
             elif self.layout_mode == "focus" and pane and pane != self.main:
                 self.main = self.promoted = pane  # clicking a small view makes it the big one
             elif pane == "cloud":
@@ -397,7 +412,7 @@ class Gui:
                 cv2.EVENT_FLAG_LBUTTON | cv2.EVENT_FLAG_RBUTTON | cv2.EVENT_FLAG_MBUTTON):
             self.pan_by(x - self.pan_drag[0], y - self.pan_drag[1])
             self.pan_drag = (x, y)
-        elif event == cv2.EVENT_LBUTTONDBLCLK and pane:
+        elif event == cv2.EVENT_LBUTTONDBLCLK and pane and not self.selecting and self.pick is None:
             # Double-click a view to enlarge it; double-click the big view to go back to the grid.
             if pane == self.promoted:
                 pass  # second half of the click that just enlarged this view
@@ -433,7 +448,7 @@ class Window:
         pygame.display.init()
         pygame.display.set_caption(title)
         pygame.key.set_repeat(300, 40)  # held arrow keys keep panning
-        self.windowed_size = (1280, 900)
+        self.windowed_size = (max(1280, gui.min_width), 900)
         self.fullscreen = None
         self.scale = (1.0, 1.0)
         self.last_click = (0.0, 0, 0)
@@ -596,6 +611,15 @@ def run(args, cam, model, dev):
     gui = Gui(args)
     luts = {name: torch.from_numpy(lut).to(dev) for name, lut in gui.luts.items()}
     win = Window("PS3 Eye depth", gui)
+
+    tracker = segmenter = None
+    if args.pose:
+        import pose_client
+
+        tracker = pose_client.PoseTracker(args.pose_host, args.pose_port)
+        segmenter = pose_client.Segmenter(args.sam_model, dev)
+    K_model = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
+    pose_mask, pose_mask_until = None, 0.0  # last segmentation, shown briefly as an overlay
     aspect = cam.width / cam.height
 
     vis = pcd = o3d = None
@@ -677,6 +701,24 @@ def run(args, cam, model, dev):
             depth_bgr[~in_range] = 45  # outside the selected range: flat grey
         keep = valid & stride_mask
         bgr_small = (rgb[0].permute(1, 2, 0).flip(-1) * 255).byte()
+
+        # 6D pose: FoundationPose gets the model-resolution image, the depth with unreliable
+        # pixels zeroed (it treats 0 as missing) and the matching intrinsics.
+        pose = None
+        if tracker is not None:
+            pick, gui.pick = gui.pick, None
+            if pick is not None or tracker.registered:
+                rgb_np = bgr_small.flip(-1).cpu().numpy()
+                depth_np = torch.where(valid, depth, torch.zeros_like(depth)).float().cpu().numpy()
+                if pick is not None:
+                    u, v = min(int(pick[0] * mw), mw - 1), min(int(pick[1] * mh), mh - 1)
+                    pose_mask = segmenter(rgb_np, u, v)
+                    pose_mask_until = time.perf_counter() + 1.5
+                    print(f"Object mask: {int(pose_mask.sum())} px at ({u}, {v})")
+                    tracker.register(rgb_np, depth_np, K_model, pose_mask)
+                else:
+                    tracker.track(rgb_np, depth_np, K_model)
+            pose = tracker.pose
         if int(keep.sum()):
             pivot_z = 0.9 * pivot_z + 0.1 * float(depth[keep].median())
 
@@ -704,6 +746,15 @@ def run(args, cam, model, dev):
             label(tile, text)
             if pane != "cloud":
                 cv2.drawMarker(tile, (int(px * cw), int(py * ch)), (0, 255, 0), cv2.MARKER_CROSS, 14, 1)
+            if tracker is not None and pane in ("camera", "depth"):
+                if pane == "camera" and pose_mask is not None and time.perf_counter() < pose_mask_until:
+                    m = cv2.resize(pose_mask.astype(np.uint8), (cw, ch), interpolation=cv2.INTER_NEAREST).astype(bool)
+                    tile[m] = (0.5 * tile[m] + np.array([0, 110, 0])).astype(np.uint8)  # green tint
+                if pose is not None:
+                    K_tile = np.diag([cw / mw, ch / mh, 1.0]) @ K_model
+                    pose_client.draw_pose(tile, pose, K_tile, tracker.extents, tracker.to_origin)
+                if pane == "camera" and gui.selecting:
+                    label(tile, "Click the object to track", (8, 44), 0.6)
             if pane in ("depth", "confidence"):
                 # Colour bar with the value range.
                 top, bottom = (lo, hi) if pane == "depth" else (1.0, 0.0)
@@ -721,6 +772,11 @@ def run(args, cam, model, dev):
         where = "centre" if probe_pane in (None, "cloud") else "cursor"
         status = (f"{fps:5.1f} FPS    {where}: {probe_depth:.2f} m, confidence {probe_conf:.2f}"
                   f"    colours {lo:.2f}-{hi:.2f} m    {int(keep.sum()):,} points")
+        if tracker is not None:
+            status += f"    pose: {tracker.status}"
+            if pose is not None:
+                t = pose[:3, 3]
+                status += f" {tracker.ms:.0f} ms  x {t[0]:+.2f} y {t[1]:+.2f} z {t[2]:+.2f} m"
         cv2.putText(canvas, status, (8, canvas.shape[0] - 7), FONT, 0.48, (210, 210, 210), 1, cv2.LINE_AA)
         win.show(canvas)
 
@@ -757,6 +813,10 @@ def run(args, cam, model, dev):
                 gui.next_cmap()
             elif ch == "l":
                 gui.next_layout()
+            elif ch == "p" and tracker is not None:
+                gui.selecting = not gui.selecting
+            elif ch == "o" and tracker is not None:
+                tracker.stop()
             elif ch == "i":
                 gui.invert = not gui.invert
             elif ch == "a":
@@ -782,9 +842,13 @@ def run(args, cam, model, dev):
             cv2.imwrite(f"view_{stamp}.png", canvas)
             write_ply(f"cloud_{stamp}.ply", (pts[keep] * y_up).cpu().numpy(), bgr_small[keep].flip(-1).cpu().numpy())
             print(f"Saved depth_{stamp}.npy, cloud_{stamp}.ply, view_{stamp}.png")
+        if "stop_pose" in gui.pending and tracker is not None:
+            tracker.stop()
         gui.pending.clear()
 
     win.close()
+    if tracker is not None:
+        tracker.close()
     if vis is not None:
         vis.destroy_window()
 
@@ -814,6 +878,12 @@ def parse_args(argv=None):
     ap.add_argument("--layout", choices=LAYOUTS, default="grid",
                     help="how views are arranged: even grid, stacked vertically, or one big view (l cycles)")
     ap.add_argument("--fullscreen", action="store_true", help="start in fullscreen (f or the toolbar button toggles)")
+    ap.add_argument("--pose", action="store_true",
+                    help="6D object pose with FoundationPose: connect to fp_server.py and show the Select object button")
+    ap.add_argument("--pose-host", default="127.0.0.1", help="where fp_server.py runs")
+    ap.add_argument("--pose-port", type=int, default=pose_protocol.DEFAULT_PORT)
+    ap.add_argument("--sam-model", default="facebook/sam-vit-base",
+                    help="Segment Anything checkpoint for click-to-segment (e.g. facebook/sam-vit-large)")
     ap.add_argument("--open3d", action="store_true", help="also open a separate Open3D point cloud window")
     args = ap.parse_args(argv)
     args.views = [v.strip() for v in args.views.split(",") if v.strip()]
