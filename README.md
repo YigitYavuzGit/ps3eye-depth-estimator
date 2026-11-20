@@ -113,6 +113,13 @@ Things to know:
 - `--pose-host` / `--pose-port` point the viewer at a server elsewhere; `fp_server.py --host`
   controls which interface it listens on (this machine only by default).
 
+## Trying the data in Delta DIAVision
+
+**Save** (`s`) also writes a `diavision_<time>/` folder in the formats DIAVision's VirtualCamera
+loads (Manage > Platform Settings > VirtualCamera): `image.png` (8-bit), `depth_mm.png` (16-bit
+depth map, millimetres, 0 = no data) and `cloud_mm.pcd` (points in millimetres, x right, y down,
+z forward from the lens). This is a file hand-off for testing, not a live connection.
+
 ## Notes
 
 - The viewer window uses pygame (SDL), not OpenCV's own window, whose Qt backend zooms the whole

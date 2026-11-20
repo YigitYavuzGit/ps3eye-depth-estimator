@@ -594,6 +594,30 @@ def write_ply(path, points, colours_rgb):
         f.write(vertex.tobytes())
 
 
+def write_pcd(path, points):
+    """Binary PCD (x y z float32), unorganised."""
+    points = np.ascontiguousarray(points, dtype="<f4")
+    header = ("# .PCD v0.7 - Point Cloud Data file format\nVERSION 0.7\nFIELDS x y z\nSIZE 4 4 4\n"
+              f"TYPE F F F\nCOUNT 1 1 1\nWIDTH {len(points)}\nHEIGHT 1\nVIEWPOINT 0 0 0 1 0 0 0\n"
+              f"POINTS {len(points)}\nDATA binary\n")
+    with open(path, "wb") as f:
+        f.write(header.encode("ascii"))
+        f.write(points.tobytes())
+
+
+def export_diavision(folder, frame, depth_m, points_m):
+    """Files that DIAVision's VirtualCamera loads: an 8-bit image, a 16-bit depth map and a
+    PCD point cloud, all in millimetres like Delta's DMV-T camera (camera frame: x right,
+    y down, z forward, origin at the lens). Depth 0 = no data."""
+    os.makedirs(folder, exist_ok=True)
+    cv2.imwrite(os.path.join(folder, "image.png"), cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+    depth_mm = np.clip(np.nan_to_num(depth_m) * 1000.0, 0, 65535).round().astype(np.uint16)
+    # Same pixel grid as image.png so the two overlay in DIAVision.
+    depth_mm = cv2.resize(depth_mm, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
+    cv2.imwrite(os.path.join(folder, "depth_mm.png"), depth_mm)
+    write_pcd(os.path.join(folder, "cloud_mm.pcd"), points_m * 1000.0)
+
+
 def label(img, text, org=(8, 20), scale=0.5):
     """White text with a black outline. The outline is drawn as shifted copies because a
     thicker stroke changes glyph spacing in newer OpenCV and would not line up."""
@@ -859,7 +883,9 @@ def run(args, cam, model, dev):
             np.save(f"depth_{stamp}.npy", depth.cpu().numpy())
             cv2.imwrite(f"view_{stamp}.png", canvas)
             write_ply(f"cloud_{stamp}.ply", (pts[keep] * y_up).cpu().numpy(), bgr_small[keep].flip(-1).cpu().numpy())
-            print(f"Saved depth_{stamp}.npy, cloud_{stamp}.ply, view_{stamp}.png")
+            export_diavision(f"diavision_{stamp}", frame,
+                             torch.where(valid, depth, torch.zeros_like(depth)).cpu().numpy(), pts[keep].cpu().numpy())
+            print(f"Saved depth_{stamp}.npy, cloud_{stamp}.ply, view_{stamp}.png, diavision_{stamp}/")
         if "stop_pose" in gui.pending and tracker is not None:
             tracker.stop()
         gui.pending.clear()
