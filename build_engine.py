@@ -22,16 +22,20 @@ REPOS = {
 
 
 class Wrapper(torch.nn.Module):
-    def __init__(self, model):
+    """float32 in, float32 depth (1, H, W) in metres out; optionally half precision inside."""
+
+    def __init__(self, model, half):
         super().__init__()
-        self.model = model
+        self.model = model.half() if half else model
+        self.half = half
 
     def forward(self, image):
-        # (1, H, W) depth in metres
+        if self.half:
+            return self.model(pixel_values=image.half()).predicted_depth.float()
         return self.model(pixel_values=image).predicted_depth
 
 
-def export_onnx(encoder, height, width, onnx_path):
+def export_onnx(encoder, height, width, onnx_path, half=False):
     from transformers import AutoModelForDepthEstimation
 
     if height % 14 or width % 14:
@@ -46,13 +50,21 @@ def export_onnx(encoder, height, width, onnx_path):
     )
     with torch.no_grad():
         try:
-            torch.onnx.export(Wrapper(model), (dummy,), onnx_path, dynamo=False, **kwargs)
+            torch.onnx.export(Wrapper(model, half), (dummy,), onnx_path, dynamo=False, **kwargs)
         except TypeError:  # older torch without the dynamo keyword
-            torch.onnx.export(Wrapper(model), (dummy,), onnx_path, **kwargs)
+            torch.onnx.export(Wrapper(model, half), (dummy,), onnx_path, **kwargs)
     print(f"ONNX written: {onnx_path}")
 
 
-def build_engine(onnx_path, engine_path, fp16, workspace_gb):
+def has_fp16_flag():
+    """TensorRT <= 10 picks FP16 via a builder flag. TensorRT 11 removed it: networks are
+    strongly typed, so precision has to be baked into the ONNX model instead."""
+    import tensorrt as trt
+
+    return hasattr(trt.BuilderFlag, "FP16")
+
+
+def build_engine(onnx_path, engine_path, fp16_flag, workspace_gb):
     import tensorrt as trt
 
     logger = trt.Logger(trt.Logger.INFO)
@@ -71,7 +83,7 @@ def build_engine(onnx_path, engine_path, fp16, workspace_gb):
 
     config = builder.create_builder_config()
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_gb << 30)
-    if fp16:
+    if fp16_flag:
         config.set_flag(trt.BuilderFlag.FP16)
 
     print("Building TensorRT engine (takes a few minutes)...")
@@ -94,16 +106,20 @@ def main():
     ap.add_argument("--out", default=None, help="engine path (default: da2_metric_<encoder>.engine)")
     args = ap.parse_args()
 
+    fp16 = not args.fp32
+    # Old TensorRT: FP32 ONNX + FP16 builder flag. TensorRT 11+: export the ONNX in FP16.
+    use_flag = fp16 and (args.onnx_only or has_fp16_flag())
+    half_onnx = fp16 and not use_flag
     stem = f"da2_metric_{args.encoder}_{args.height}x{args.width}"
-    onnx_path = stem + ".onnx"
+    onnx_path = stem + ("_fp16" if half_onnx else "") + ".onnx"
     engine_path = args.out or f"da2_metric_{args.encoder}.engine"
 
     if not os.path.exists(onnx_path):
-        export_onnx(args.encoder, args.height, args.width, onnx_path)
+        export_onnx(args.encoder, args.height, args.width, onnx_path, half=half_onnx)
     else:
         print(f"Reusing {onnx_path}")
     if not args.onnx_only:
-        build_engine(onnx_path, engine_path, not args.fp32, args.workspace_gb)
+        build_engine(onnx_path, engine_path, use_flag, args.workspace_gb)
 
 
 if __name__ == "__main__":
