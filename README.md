@@ -26,7 +26,8 @@ python live_depth.py --engine da2_metric_large.engine --calib calib.npz
 Everything is selectable with the mouse in the window's toolbar:
 
 - **Views** (any combination, tiled): camera, depth, intensity, confidence, surface normals,
-  and a point cloud preview. In the point cloud view, drag to orbit and scroll to zoom.
+  and a point cloud preview. In the point cloud view, drag to orbit,
+  right-drag (or middle-drag, Shift+drag, arrow keys) to pan, and scroll to zoom.
 - **Colour map**: click a swatch (inferno, jet, rainbow, turbo, viridis, ... and grey).
 - **Range slider**: drag the near and far handles to set the depth range. Colours span it, and
   everything outside is greyed out in the depth view and removed from the point cloud.

@@ -6,7 +6,8 @@
 Everything is selectable with the mouse in the window's toolbar: which views are
 shown (camera, depth, intensity, confidence, normals, point cloud), the colour map,
 invert, auto range, the point cloud colouring, and the depth range (drag the two
-handles of the range slider). In the point cloud view, drag to orbit and scroll to zoom.
+handles of the range slider). In the point cloud view, drag to orbit, right-drag
+(or middle-drag, Shift+drag, arrow keys) to pan, and scroll to zoom.
 
 Keys: 1-6 toggle views, c next colour map, i invert, a auto range, r reset cloud
 view, +/- zoom cloud, [ ] move the far limit, ; ' move the near limit,
@@ -170,6 +171,9 @@ class Gui:
         self.zoom = 1.0
         self.mouse = (-1, -1)
         self.drag = None
+        self.pan = [0.0, 0.0]        # cloud view shift in metres (right, down)
+        self.pan_drag = None
+        self.metres_per_px = 0.005   # at the orbit centre; updated every frame by the renderer
         # Depth range in metres: colours span it and everything outside is clipped.
         self.limit = max(args.range_limit, args.max_depth)
         self.near, self.far = args.min_depth, args.max_depth
@@ -301,8 +305,13 @@ class Gui:
         names = list(COLORMAPS)
         self.cmap = names[(names.index(self.cmap) + 1) % len(names)]
 
+    def pan_by(self, dx_px, dy_px):
+        self.pan[0] += dx_px * self.metres_per_px
+        self.pan[1] += dy_px * self.metres_per_px
+
     def reset_view(self):
         self.yaw = self.pitch = 0.0
+        self.pan = [0.0, 0.0]
         self.zoom = 1.0
 
     def zoom_by(self, factor):
@@ -375,7 +384,19 @@ class Gui:
             elif self.layout_mode == "focus" and pane and pane != self.main:
                 self.main = self.promoted = pane  # clicking a small view makes it the big one
             elif pane == "cloud":
-                self.drag = (x, y)
+                # Shift + left drag pans, plain left drag orbits.
+                if flags & cv2.EVENT_FLAG_SHIFTKEY:
+                    self.pan_drag = (x, y)
+                else:
+                    self.drag = (x, y)
+        elif event in (cv2.EVENT_RBUTTONDOWN, cv2.EVENT_MBUTTONDOWN) and pane == "cloud":
+            self.pan_drag = (x, y)  # right or middle drag pans
+        elif event in (cv2.EVENT_RBUTTONUP, cv2.EVENT_MBUTTONUP):
+            self.pan_drag = None
+        elif event == cv2.EVENT_MOUSEMOVE and self.pan_drag and flags & (
+                cv2.EVENT_FLAG_LBUTTON | cv2.EVENT_FLAG_RBUTTON | cv2.EVENT_FLAG_MBUTTON):
+            self.pan_by(x - self.pan_drag[0], y - self.pan_drag[1])
+            self.pan_drag = (x, y)
         elif event == cv2.EVENT_LBUTTONDBLCLK and pane:
             # Double-click a view to enlarge it; double-click the big view to go back to the grid.
             if pane == self.promoted:
@@ -391,7 +412,7 @@ class Gui:
             self.pitch = min(max(self.pitch + (y - self.drag[1]) * 0.008, -1.45), 1.45)
             self.drag = (x, y)
         elif event == cv2.EVENT_LBUTTONUP:
-            self.drag = self.slider_drag = None
+            self.drag = self.slider_drag = self.pan_drag = None
         elif event == cv2.EVENT_MOUSEWHEEL and pane == "cloud":
             # The wheel delta is carried in the sign of flags (positive = scroll up / away).
             self.zoom_by(0.88 if flags > 0 else 1 / 0.88)
@@ -411,6 +432,7 @@ class Window:
         self.pg, self.gui = pygame, gui
         pygame.display.init()
         pygame.display.set_caption(title)
+        pygame.key.set_repeat(300, 40)  # held arrow keys keep panning
         self.windowed_size = (1280, 900)
         self.fullscreen = None
         self.scale = (1.0, 1.0)
@@ -447,18 +469,29 @@ class Window:
             if e.type == pg.QUIT:
                 closed = True
             elif e.type == pg.KEYDOWN:
-                keys.append("\x1b" if e.key == pg.K_ESCAPE else e.unicode)
+                arrows = {pg.K_LEFT: "left", pg.K_RIGHT: "right", pg.K_UP: "up", pg.K_DOWN: "down"}
+                keys.append("\x1b" if e.key == pg.K_ESCAPE else arrows.get(e.key, e.unicode))
+            elif e.type == pg.MOUSEBUTTONDOWN and e.button in (2, 3):
+                event = cv2.EVENT_MBUTTONDOWN if e.button == 2 else cv2.EVENT_RBUTTONDOWN
+                gui.on_mouse(event, *self._canvas_xy(e.pos), 0)
+            elif e.type == pg.MOUSEBUTTONUP and e.button in (2, 3):
+                event = cv2.EVENT_MBUTTONUP if e.button == 2 else cv2.EVENT_RBUTTONUP
+                gui.on_mouse(event, *self._canvas_xy(e.pos), 0)
             elif e.type == pg.MOUSEBUTTONDOWN and e.button == 1:
                 x, y = self._canvas_xy(e.pos)
                 now = time.perf_counter()
                 t, px, py = self.last_click
                 double = now - t < self.DOUBLE_CLICK and abs(x - px) < 6 and abs(y - py) < 6
                 self.last_click = (0.0 if double else now, x, y)
-                gui.on_mouse(cv2.EVENT_LBUTTONDBLCLK if double else cv2.EVENT_LBUTTONDOWN, x, y, cv2.EVENT_FLAG_LBUTTON)
+                shift = cv2.EVENT_FLAG_SHIFTKEY if pg.key.get_mods() & pg.KMOD_SHIFT else 0
+                gui.on_mouse(cv2.EVENT_LBUTTONDBLCLK if double else cv2.EVENT_LBUTTONDOWN, x, y,
+                             cv2.EVENT_FLAG_LBUTTON | shift)
             elif e.type == pg.MOUSEBUTTONUP and e.button == 1:
                 gui.on_mouse(cv2.EVENT_LBUTTONUP, *self._canvas_xy(e.pos), 0)
             elif e.type == pg.MOUSEMOTION:
-                gui.on_mouse(cv2.EVENT_MOUSEMOVE, *self._canvas_xy(e.pos), cv2.EVENT_FLAG_LBUTTON if e.buttons[0] else 0)
+                held = ((cv2.EVENT_FLAG_LBUTTON if e.buttons[0] else 0) | (cv2.EVENT_FLAG_MBUTTON if e.buttons[1] else 0)
+                        | (cv2.EVENT_FLAG_RBUTTON if e.buttons[2] else 0))
+                gui.on_mouse(cv2.EVENT_MOUSEMOVE, *self._canvas_xy(e.pos), held)
             elif e.type == pg.MOUSEWHEEL and e.y:
                 # Applies to the view under the pointer (last position the GUI saw).
                 gui.on_mouse(cv2.EVENT_MOUSEWHEEL, *gui.mouse, 1 if e.y > 0 else -1)
@@ -488,7 +521,9 @@ def render_cloud(pts, cols, gui, pivot_z, w, h, f, splat=2):
     cy, sy, cp, sp = math.cos(gui.yaw), math.sin(gui.yaw), math.cos(gui.pitch), math.sin(gui.pitch)
     rot = pts.new_tensor([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]]) @ pts.new_tensor([[1, 0, 0], [0, cp, -sp], [0, sp, cp]])
     p = (pts - pts.new_tensor([0.0, 0.0, pivot_z])) @ rot.T
+    p = p + pts.new_tensor([gui.pan[0], gui.pan[1], 0.0])  # pan: slide the scene in the view plane
     z = p[:, 2] + pivot_z * gui.zoom
+    gui.metres_per_px = float(pivot_z * gui.zoom / f)  # so a pan drag follows the pointer at the orbit centre
     front = z > 0.05
     zc = z.clamp_min(0.05)
     ui = (f * p[:, 0] / zc + w / 2).clamp(-1e6, 1e6).floor().long()
@@ -661,7 +696,7 @@ def run(args, cam, model, dev):
                 # Bigger splats when the view is larger than the depth map or zoomed in, to avoid holes.
                 splat = min(6, max(2, math.ceil(1.6 * cw / mw / min(max(gui.zoom, 0.4), 1.0))))
                 view = render_cloud(pts[keep], colours[keep], gui, pivot_z, cw, ch, fx * cw / mw, splat).cpu().numpy()
-                text = "Point cloud (drag: orbit, wheel: zoom)"
+                text = "Point cloud (drag: orbit, right-drag: pan, wheel: zoom)"
             if view.shape[:2] != (ch, cw):
                 view = cv2.resize(view, (cw, ch), interpolation=cv2.INTER_LINEAR)
             tile = canvas[y0:y0 + ch, x0:x0 + cw]
@@ -726,6 +761,9 @@ def run(args, cam, model, dev):
                 gui.invert = not gui.invert
             elif ch == "a":
                 gui.auto_range = not gui.auto_range
+            elif ch in ("left", "right", "up", "down"):
+                step = {"left": (40, 0), "right": (-40, 0), "up": (0, 40), "down": (0, -40)}[ch]
+                gui.pan_by(*step)
             elif ch == "r":
                 gui.reset_view()
             elif ch in "+=":
