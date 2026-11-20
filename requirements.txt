@@ -4,6 +4,5 @@ tensorrt
 transformers
 onnx
 opencv-python
-pygame
-open3d
+pygame-ce
 numpy

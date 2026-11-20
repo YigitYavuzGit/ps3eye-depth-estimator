@@ -47,7 +47,7 @@ Keys: `1`-`6` toggle views, `c` next colour map, `i` invert, `a` auto range, `r`
 
 The confidence view is an estimate, not a model output: Depth Anything V2 does not predict
 confidence, so it is derived from depth discontinuities and frame-to-frame stability.
-`--min-conf 0.5` drops low-confidence points from the cloud. `--open3d` additionally opens a
+`--min-conf 0.5` drops low-confidence points from the cloud. `--open3d` (needs `pip install open3d`) additionally opens a
 full Open3D point cloud window.
 Run any script with `--help` for all options.
 
@@ -133,7 +133,7 @@ the PS3 Eye needs a DirectShow driver there, and TensorRT engines have to be reb
 
 ## Notes
 
-- The viewer window uses pygame (SDL), not OpenCV's own window, whose Qt backend zooms the whole
+- The viewer window uses pygame-ce (SDL; imported as `pygame`), not OpenCV's own window, whose Qt backend zooms the whole
   image on mouse wheel. `calibrate.py` still uses an OpenCV window.
 
 - `large` gives the best quality; build `--encoder small` for the camera's full 60 FPS.
