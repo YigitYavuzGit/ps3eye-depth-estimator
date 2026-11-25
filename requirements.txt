@@ -1,8 +1,9 @@
 torch
 torchvision
-tensorrt
 transformers
-onnx
 opencv-python
 pygame-ce
 numpy
+# NVIDIA only (TensorRT backend); not available on macOS
+tensorrt; sys_platform != "darwin"
+onnx; sys_platform != "darwin"

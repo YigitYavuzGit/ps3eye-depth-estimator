@@ -51,6 +51,25 @@ confidence, so it is derived from depth discontinuities and frame-to-frame stabi
 full Open3D point cloud window.
 Run any script with `--help` for all options.
 
+## macOS (Apple silicon) and machines without TensorRT
+
+The viewer also has a PyTorch backend that needs no engine build. It is picked automatically when
+there is no NVIDIA GPU or no engine file, and uses the Apple GPU (MPS) on a Mac.
+
+```bash
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt        # TensorRT and ONNX are skipped on macOS
+python live_depth.py --encoder small   # or base / large; add --half to try half precision
+```
+
+- macOS has no PS3 Eye driver, so use the built-in camera or a USB webcam (`--device 0`, `1`, ...).
+  Allow camera access for your terminal when macOS asks. Widescreen cameras are centre-cropped
+  to 4:3.
+- Calibrate that camera with `calibrate.py` (it applies the same crop); a calibration from the
+  PS3 Eye does not carry over.
+- The FoundationPose bridge (`--pose`) needs an NVIDIA machine for the server side.
+- Force a backend with `--backend torch` or `--backend tensorrt`.
+
 ## Tuning GPU load, speed and accuracy
 
 By default the viewer processes every camera frame (up to 60 per second), which keeps the GPU busy.

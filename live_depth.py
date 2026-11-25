@@ -29,6 +29,9 @@ import sys
 import threading
 import time
 
+# Apple GPUs (MPS) lack a few operations used here; let PyTorch run those on the CPU instead of failing.
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
 import cv2
 import numpy as np
 import torch
@@ -65,12 +68,30 @@ def colormap_lut(name):
 
 
 def camera_backend():
-    """V4L2 on Linux; DirectShow on Windows (the PS3 Eye needs a DirectShow driver there)."""
+    """V4L2 on Linux; DirectShow on Windows (the PS3 Eye needs a DirectShow driver there);
+    AVFoundation on macOS (built-in or USB webcam; macOS has no PS3 Eye driver)."""
     if sys.platform.startswith("linux"):
         return cv2.CAP_V4L2
     if sys.platform == "win32":
         return cv2.CAP_DSHOW
+    if sys.platform == "darwin":
+        return cv2.CAP_AVFOUNDATION
     return cv2.CAP_ANY
+
+
+def centre_crop(frame, aspect):
+    """Crops a frame to width/height = aspect around its centre (no-op if it already matches).
+    Widescreen webcams are cropped to the 4:3 shape the depth model is built for."""
+    h, w = frame.shape[:2]
+    if abs(w / h - aspect) < 0.02:
+        return frame
+    if w / h > aspect:
+        new_w = int(round(h * aspect))
+        x0 = (w - new_w) // 2
+        return np.ascontiguousarray(frame[:, x0:x0 + new_w])
+    new_h = int(round(w / aspect))
+    y0 = (h - new_h) // 2
+    return np.ascontiguousarray(frame[y0:y0 + new_h])
 
 
 class Camera:
@@ -84,9 +105,11 @@ class Camera:
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         self.cap.set(cv2.CAP_PROP_FPS, fps)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.aspect = width / height
         ok, frame = self.cap.read()
         if not ok:
-            raise SystemExit("Camera opened but returned no frame")
+            raise SystemExit("Camera opened but returned no frame (on macOS: allow camera access for the terminal)")
+        frame = centre_crop(frame, self.aspect)
         self.height, self.width = frame.shape[:2]
         self.frame, self.seq, self.running = frame, 1, True
         self.cond = threading.Condition()
@@ -98,6 +121,7 @@ class Camera:
             if not ok:
                 time.sleep(0.005)
                 continue
+            frame = centre_crop(frame, self.aspect)
             with self.cond:
                 self.frame, self.seq = frame, self.seq + 1
                 self.cond.notify()
@@ -148,6 +172,39 @@ class TRTDepth:
         # Same stream as torch, so this is ordered with the pre/post-processing ops.
         self.context.execute_async_v3(torch.cuda.current_stream().cuda_stream)
         return self.output.view(self.height, self.width)
+
+
+class TorchDepth:
+    """The same model run directly in PyTorch: no engine to build, works on Apple GPUs (MPS),
+    NVIDIA GPUs and the CPU. Slower than TensorRT where TensorRT is available."""
+
+    def __init__(self, encoder, height, width, device, half):
+        from transformers import AutoModelForDepthEstimation
+
+        from build_engine import REPOS
+
+        if height % 14 or width % 14:
+            raise SystemExit("--model-height and --model-width must be multiples of 14")
+        print(f"Loading {REPOS[encoder]} on {device} (downloaded on first use)...")
+        self.model = AutoModelForDepthEstimation.from_pretrained(REPOS[encoder]).to(device).eval()
+        self.half = half
+        if half:
+            self.model.half()
+        self.height, self.width = height, width
+        self.input = torch.empty(1, 3, height, width, dtype=torch.float32, device=device)
+
+    def infer(self):
+        with torch.no_grad():
+            x = self.input.half() if self.half else self.input
+            return self.model(pixel_values=x).predicted_depth[0].float()
+
+
+def pick_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
 
 
 def load_intrinsics(args, cam_w, cam_h):
@@ -850,8 +907,8 @@ def run(args, cam, model, dev):
         win.show(canvas)
 
         if vis is not None:
-            pcd.points = o3d.utility.Vector3dVector((pts[keep] * y_up).double().cpu().numpy())
-            pcd.colors = o3d.utility.Vector3dVector(rgb[0].permute(1, 2, 0)[keep].double().cpu().numpy())
+            pcd.points = o3d.utility.Vector3dVector((pts[keep] * y_up).cpu().double().numpy())
+            pcd.colors = o3d.utility.Vector3dVector(rgb[0].permute(1, 2, 0)[keep].cpu().double().numpy())
             if not cloud_added and len(pcd.points):
                 vis.add_geometry(pcd)
                 ctr = vis.get_view_control()
@@ -930,7 +987,15 @@ def run(args, cam, model, dev):
 
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--engine", default="da2_metric_large.engine")
+    ap.add_argument("--engine", default="da2_metric_large.engine", help="TensorRT engine from build_engine.py")
+    ap.add_argument("--backend", choices=("auto", "tensorrt", "torch"), default="auto",
+                    help="auto: TensorRT when an NVIDIA GPU and the engine file are present, else PyTorch "
+                         "(Apple GPU, NVIDIA GPU or CPU)")
+    ap.add_argument("--encoder", choices=("small", "base", "large"), default="small",
+                    help="model size for the PyTorch backend (the TensorRT engine has its size built in)")
+    ap.add_argument("--model-height", type=int, default=392, help="PyTorch backend: model input height (multiple of 14)")
+    ap.add_argument("--model-width", type=int, default=518, help="PyTorch backend: model input width (multiple of 14)")
+    ap.add_argument("--half", action="store_true", help="PyTorch backend: half precision (faster; drop it if depth looks broken)")
     ap.add_argument("--device", default=0, type=lambda v: int(v) if v.isdigit() else v, help="camera index or /dev/videoN")
     ap.add_argument("--width", type=int, default=640)
     ap.add_argument("--height", type=int, default=480)
@@ -976,13 +1041,23 @@ def parse_args(argv=None):
 
 def main():
     args = parse_args()
-    if not torch.cuda.is_available():
-        raise SystemExit("CUDA not available to PyTorch")
-    model = TRTDepth(args.engine)
+    dev = pick_device()
+    backend = args.backend
+    if backend == "auto":
+        backend = "tensorrt" if dev.type == "cuda" and os.path.exists(args.engine) else "torch"
+    if backend == "tensorrt":
+        if dev.type != "cuda":
+            raise SystemExit("The TensorRT backend needs an NVIDIA GPU; use --backend torch")
+        model = TRTDepth(args.engine)
+    else:
+        if dev.type == "cpu":
+            print("No GPU available to PyTorch: running on the CPU, which will be slow")
+        model = TorchDepth(args.encoder, args.model_height, args.model_width, dev, args.half)
+    print(f"Backend: {backend} on {dev}")
     cam = Camera(args.device, args.width, args.height, args.fps)
     print(f"Camera {cam.width}x{cam.height}, model input {model.width}x{model.height}")
     try:
-        run(args, cam, model, torch.device("cuda"))
+        run(args, cam, model, dev)
     finally:
         cam.close()
 

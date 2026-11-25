@@ -14,6 +14,20 @@ import cv2
 import numpy as np
 
 
+def centre_crop(frame, aspect):
+    """Crops to width/height = aspect around the centre, exactly as live_depth.py does."""
+    h, w = frame.shape[:2]
+    if abs(w / h - aspect) < 0.02:
+        return frame
+    if w / h > aspect:
+        new_w = int(round(h * aspect))
+        x0 = (w - new_w) // 2
+        return np.ascontiguousarray(frame[:, x0:x0 + new_w])
+    new_h = int(round(w / aspect))
+    y0 = (h - new_h) // 2
+    return np.ascontiguousarray(frame[y0:y0 + new_h])
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--device", default=0, type=lambda v: int(v) if v.isdigit() else v)
@@ -25,7 +39,8 @@ def main():
     ap.add_argument("--out", default="calib.npz")
     args = ap.parse_args()
 
-    cap = cv2.VideoCapture(args.device, cv2.CAP_V4L2 if sys.platform.startswith("linux") else cv2.CAP_ANY)
+    backend = {"linux": cv2.CAP_V4L2, "win32": cv2.CAP_DSHOW, "darwin": cv2.CAP_AVFOUNDATION}.get(sys.platform, cv2.CAP_ANY)
+    cap = cv2.VideoCapture(args.device, backend)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
     if not cap.isOpened():
@@ -41,6 +56,7 @@ def main():
         ok, frame = cap.read()
         if not ok:
             continue
+        frame = centre_crop(frame, args.width / args.height)  # same crop as live_depth.py
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         size = gray.shape[::-1]
         found, corners = cv2.findChessboardCorners(
